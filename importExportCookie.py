@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Export Cookie to Telegram Module for Ikabot
+Import/Export Cookie Module for Ikabot
 
 This module exports the current session cookie to Telegram in a JavaScript
 format that can be used to import the cookie into a browser console.
@@ -63,7 +63,7 @@ def wait_for_keypress_or_timeout(timeout_seconds):
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
-def exportCookieToTelegram(session, event, stdin_fd, predetermined_input):
+def importExportCookie(session, event, stdin_fd, predetermined_input):
     """Export the session cookie to Telegram in JavaScript format.
     
     Parameters
