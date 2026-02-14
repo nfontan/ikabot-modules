@@ -33,7 +33,7 @@ def print_module_banner(mode_name=None, mode_description=None):
     """
     print("\n")
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║       RESOURCE TRANSPORT MANAGER v0.19                    ║")
+    print("║       RESOURCE TRANSPORT MANAGER v1.0                    ║")
     
     if mode_name:
         print("║──────────────────────────────────────────────────────────║")
@@ -102,36 +102,37 @@ def acquire_shipping_lock(session, use_freighters=False, timeout=300):
     
     while time.time() - start_time < timeout:
         try:
-            # Try to check if lock file exists
-            if not os.path.exists(lock_file):
-                # Create lock file
-                with open(lock_file, 'w') as f:
-                    lock_data = {
-                        'pid': os.getpid(),
-                        'timestamp': time.time(),
-                        'ship_type': 'freighters' if use_freighters else 'merchant_ships',
-                        'server': session.servidor,
-                        'username': session.username
-                    }
-                    json.dump(lock_data, f)
-                return True
-            else:
-                # Lock exists, check if it's stale (older than 10 minutes)
-                try:
-                    with open(lock_file, 'r') as f:
-                        lock_data = json.load(f)
-                        if time.time() - lock_data['timestamp'] > 600:
-                            # Stale lock, remove it
-                            os.remove(lock_file)
-                            continue
-                except:
-                    # Corrupted lock file, remove it
-                    try:
+            # Atomic lock creation to prevent race conditions when multiple scripts
+            # try to ship at the exact same time.
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, 'w') as f:
+                lock_data = {
+                    'pid': os.getpid(),
+                    'timestamp': time.time(),
+                    'ship_type': 'freighters' if use_freighters else 'merchant_ships',
+                    'server': session.servidor,
+                    'username': session.username
+                }
+                json.dump(lock_data, f)
+            return True
+        except FileExistsError:
+            # Lock exists, check if it's stale (older than 10 minutes)
+            try:
+                with open(lock_file, 'r') as f:
+                    lock_data = json.load(f)
+                    if time.time() - lock_data['timestamp'] > 600:
+                        # Stale lock, remove it and immediately retry
                         os.remove(lock_file)
-                    except:
-                        pass
-                    continue
-        except Exception as e:
+                        continue
+            except Exception:
+                # Corrupted lock file, remove it so lock can be recreated
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
+                continue
+        except Exception:
+            # Ignore transient filesystem errors and retry until timeout.
             pass
         
         # Wait before trying again
@@ -1715,7 +1716,6 @@ def do_it_distribute(session, origin_city, destination_cities, interval_hours, r
         
         first_run = False
         time.sleep(60 * 60)  # Sleep for 1 hour, then check if it's time
-
 
 
 
