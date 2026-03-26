@@ -349,23 +349,16 @@ def send_shipment(session, route, useFreighters, notif_config, log_path,
         session.setStatus(f"{prefix}Sending resources...")
         executeRoutes(session, [route], useFreighters)
 
-        ships_after = (
-            getAvailableFreighters(session) if useFreighters
-            else getAvailableShips(session)
-        )
+        # If executeRoutes completes without error, the shipment was sent.
+        # We do NOT verify by comparing ship counts before/after because
+        # ships from earlier shipments can return during sending, making
+        # the count unreliable and causing false "failure" reports.
         ship_cap, freighter_cap = getShipCapacity(session)
         capacity = freighter_cap if useFreighters else ship_cap
         ships_needed = math.ceil(total_cargo / capacity) if capacity > 0 else 0
-        ships_used = ships_before - ships_after
-
-        if ships_used < ships_needed:
-            raise Exception(
-                f"Expected {ships_needed} ships but only "
-                f"{ships_used} were used"
-            )
 
         result["success"] = True
-        result["ships_used"] = ships_used
+        result["ships_used"] = ships_needed
 
         res_desc = ", ".join(
             f"{addThousandSeparator(resources[i])} {materials_names[i]}"
