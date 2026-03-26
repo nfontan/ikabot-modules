@@ -93,12 +93,17 @@ LOG_COLUMNS = [
 
 
 def get_log_path(session, default_dir=None):
+    """Get path to the shared shipment log file.
+    All accounts write to the SAME file — the 'Account' column identifies
+    which account each row belongs to. Uses append mode so concurrent
+    accounts never overwrite each other's data.
+    """
     if default_dir is None:
         default_dir = os.path.expanduser("~")
-    safe = session.username.replace("/", "_").replace("\\", "_")
-    default_path = os.path.join(default_dir, f"shipment_log_{safe}.csv")
+    default_path = os.path.join(default_dir, "shipment_log.csv")
     print(f"Shipment log file (Enter for default):")
     print(f"  Default: {default_path}")
+    print(f"  (All accounts share one file — each row has an Account column)")
     user_path = read(msg="Log path: ", empty=True)
     if user_path.strip() == "":
         return default_path
