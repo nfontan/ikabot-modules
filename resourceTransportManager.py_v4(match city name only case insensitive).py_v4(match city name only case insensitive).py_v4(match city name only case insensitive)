@@ -9,6 +9,7 @@ import math
 import os
 import re
 import csv
+import tempfile
 
 from ikabot.config import *
 from ikabot.helpers.botComm import *
@@ -163,6 +164,136 @@ def getShipCapacity(session):
     ship_capacity = int(html.split('singleTransporterCapacity":')[1].split(',"singleFreighterCapacity')[0])
     freighter_capacity = int(html.split('singleFreighterCapacity":')[1].split(',"draftEffect')[0])
     return ship_capacity, freighter_capacity
+
+
+def normalize_text(value):
+    return str(value or "").strip().lower()
+
+
+def parse_run_column_datetime(column_name):
+    if not column_name.startswith("Run_"):
+        return None
+    label = column_name[4:]
+    try:
+        return datetime.datetime.strptime(label, "%Y-%m-%d_%H-%M-%S")
+    except Exception:
+        return None
+
+
+def build_run_column_name(dt=None):
+    if dt is None:
+        dt = datetime.datetime.now()
+    return f"Run_{dt.strftime('%Y-%m-%d_%H-%M-%S')}"
+
+
+def write_csv_atomic(csv_path, fieldnames, rows):
+    directory = os.path.dirname(os.path.abspath(csv_path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_massdist_", suffix=".csv", dir=directory)
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as tmp_file:
+            writer = csv.DictWriter(tmp_file, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        os.replace(tmp_path, csv_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def ensure_run_columns(fieldnames, rows, max_slots=7):
+    run_columns = [c for c in fieldnames if c.startswith("Run_")]
+    missing = max_slots - len(run_columns)
+    if missing > 0:
+        for i in range(missing):
+            # Pre-seed with very old timestamps so these are naturally reused first.
+            old_dt = datetime.datetime(1970, 1, 1, 0, 0, i)
+            col = build_run_column_name(old_dt)
+            while col in fieldnames:
+                old_dt += datetime.timedelta(seconds=1)
+                col = build_run_column_name(old_dt)
+            fieldnames.append(col)
+            run_columns.append(col)
+            for row in rows:
+                row[col] = ""
+    return fieldnames, run_columns
+
+
+def get_city_location_token(city_data):
+    # Different ikariam payloads/scripts expose slot/location under different keys.
+    location_keys = [
+        "position", "cityLocation", "location", "slot", "islandPosition",
+        "citySlot", "index", "nr", "number"
+    ]
+    for key in location_keys:
+        if key in city_data and str(city_data.get(key, "")).strip() != "":
+            return str(city_data.get(key)).strip()
+    return None
+
+
+def choose_run_slot(session, event, rows, run_columns):
+    print_module_banner("Mass Distribution - Run Slot")
+    print("Choose how to start:")
+    print("(1) Start fresh (reuses the OLDEST run slot)")
+    print("(2) Resume from existing run slot")
+    print("(') Back to main menu")
+    mode = read(min=1, max=2, digit=True, additionalValues=["'"])
+    if mode == "'":
+        event.set()
+        return None, None
+
+    total_rows = len(rows)
+    completion = {col: sum(1 for r in rows if normalize_text(r.get(col, "")) == "x") for col in run_columns}
+
+    # Fresh run: pick oldest timestamp column, rename it to now, clear all entries.
+    if mode == 1:
+        dated_cols = []
+        for col in run_columns:
+            dt = parse_run_column_datetime(col)
+            if dt is None:
+                # Treat invalid names as oldest possible so they get recycled first.
+                dt = datetime.datetime(1970, 1, 1)
+            dated_cols.append((dt, col))
+        dated_cols.sort(key=lambda t: t[0])
+        oldest_col = dated_cols[0][1]
+        new_col = build_run_column_name()
+        while new_col in run_columns:
+            new_col = build_run_column_name(datetime.datetime.now() + datetime.timedelta(seconds=1))
+
+        print(f"Fresh run will reuse oldest slot: {oldest_col}")
+        print(f"New slot name: {new_col}")
+        print("Proceed? [Y/n]")
+        confirm = read(values=["y", "Y", "n", "N", "", "'"], additionalValues=["'"])
+        if confirm == "'" or confirm.lower() == "n":
+            event.set()
+            return None, None
+
+        # Rename in fieldnames + rows, clear values.
+        for i, col in enumerate(run_columns):
+            if col == oldest_col:
+                run_columns[i] = new_col
+                break
+        for row in rows:
+            row[new_col] = ""
+            if oldest_col in row:
+                del row[oldest_col]
+        return mode, new_col
+
+    # Resume mode: user picks from a numbered list (no typing column name).
+    print("")
+    print("Select run slot to resume:")
+    for i, col in enumerate(run_columns):
+        done = completion.get(col, 0)
+        print(f"({i + 1}) {col[4:]}  [{done}/{total_rows} sent]")
+    print("(') Back to main menu")
+    choice = read(min=1, max=len(run_columns), digit=True, additionalValues=["'"])
+    if choice == "'":
+        event.set()
+        return None, None
+    return mode, run_columns[choice - 1]
 
 
 def readResourceAmount(resource_name):
@@ -2198,8 +2329,9 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input, telegram
             rows = []
             with open(csv_path, newline='', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
                 required = {'X', 'Y', 'Player', 'City', 'City_Location', 'Wood', 'Wine', 'Marble', 'Crystal', 'Sulphur', 'Hours'}
-                missing = required - set(reader.fieldnames or [])
+                missing = required - set(fieldnames)
                 if missing:
                     print(f"CSV is missing columns: {', '.join(sorted(missing))}")
                     enter()
@@ -2219,11 +2351,44 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input, telegram
             event.set()
             return
 
-        interval_hours = int(rows[0]['Hours'])
+        try:
+            interval_hours = int(str(rows[0].get('Hours', '')).strip())
+        except Exception:
+            print("Invalid Hours value in CSV row 1. Hours must be a number >= 1.")
+            enter()
+            event.set()
+            return
+
+        if interval_hours <= 0:
+            print("Invalid Hours value: 0 is not allowed in Mass Distribution.")
+            print("Please set Hours to 1 or greater, then run again.")
+            enter()
+            event.set()
+            return
+
+        fieldnames, run_columns = ensure_run_columns(fieldnames, rows, max_slots=7)
+
+        mode, run_column = choose_run_slot(session, event, rows, run_columns)
+        if run_column is None:
+            return
+
+        # Rebuild fieldnames to include updated run column names (fresh-run rename path).
+        fieldnames_no_runs = [c for c in fieldnames if not c.startswith("Run_")]
+        fieldnames = fieldnames_no_runs + run_columns
+        backup_path = f"{csv_path}.bak"
+        try:
+            write_csv_atomic(csv_path, fieldnames, rows)
+            write_csv_atomic(backup_path, fieldnames, rows)
+        except Exception as e:
+            print(f"Error preparing CSV run slots: {e}")
+            enter()
+            event.set()
+            return
 
         print_module_banner("Mass Distribution")
         print(f"CSV loaded: {len(rows)} rows")
         print(f"Repeat interval: every {interval_hours} hour(s)")
+        print(f"Run slot: {run_column[4:]}")
         print("")
         print("What type of ships do you want to use?")
         print("(1) Merchant ships")
@@ -2246,9 +2411,13 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input, telegram
         print(f"Ship type:    {'Freighters' if useFreighters else 'Merchant ships'}")
         print(f"CSV rows:     {len(rows)}")
         print(f"Interval:     every {interval_hours} hour(s)")
+        print(f"Run slot:     {run_column[4:]}")
         print("")
         print("Proceed? [Y/n]")
-        rta = read(values=["y", "Y", "n", "N", ""])
+        rta = read(values=["y", "Y", "n", "N", "", "'"], additionalValues=["'"])
+        if rta == "'":
+            event.set()
+            return
         if rta.lower() == "n":
             event.set()
             return
@@ -2266,7 +2435,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input, telegram
     setInfoSignal(session, info)
 
     try:
-        do_it_mass_distribution(session, csv_path, source_city, useFreighters, interval_hours, telegram_enabled)
+        do_it_mass_distribution(session, csv_path, source_city, useFreighters, interval_hours, telegram_enabled, run_column)
     except Exception as e:
         msg = "Error in:\n{}\nCause:\n{}".format(info, traceback.format_exc())
         sendToBot(session, msg)
@@ -2274,7 +2443,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input, telegram
         session.logout()
 
 
-def do_it_mass_distribution(session, csv_path, source_city, useFreighters, interval_hours, telegram_enabled):
+def do_it_mass_distribution(session, csv_path, source_city, useFreighters, interval_hours, telegram_enabled, run_column):
     ship_type_name = "freighters" if useFreighters else "merchant ships"
     # CSV resource column order maps to materials_names [Wood, Wine, Marble, Crystal, Sulfur]
     csv_resource_cols = ['Wood', 'Wine', 'Marble', 'Crystal', 'Sulphur']
@@ -2284,6 +2453,7 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters, inter
             rows = []
             with open(csv_path, newline='', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
                 for row in reader:
                     rows.append(row)
         except Exception as e:
@@ -2294,6 +2464,18 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters, inter
             wait(3600)
             continue
 
+        # Ensure selected run column exists even if CSV was edited externally.
+        if run_column not in (fieldnames or []):
+            fieldnames, run_columns = ensure_run_columns(fieldnames, rows, max_slots=7)
+            if run_column not in run_columns:
+                run_column = run_columns[0]
+            try:
+                write_csv_atomic(csv_path, fieldnames, rows)
+            except Exception as e:
+                print(f"Error updating run columns: {e}")
+                wait(3600)
+                continue
+
         mismatches = []
         routes = []
 
@@ -2301,6 +2483,10 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters, inter
 
         for row_num, row in enumerate(rows, start=1):
             try:
+                # Resume behavior: rows with X in selected run slot are skipped.
+                if normalize_text(row.get(run_column, "")) == "x":
+                    continue
+
                 x = row['X'].strip()
                 y = row['Y'].strip()
                 expected_player = row['Player'].strip()
@@ -2313,11 +2499,32 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters, inter
 
                 cities_on_island = [c for c in island["cities"] if c.get("type") == "city"]
 
+                # Primary target matching:
+                # - City name (case-insensitive exact)
+                # - Player name (case-insensitive exact)
+                # - City_Location if available; fallback to City+Player when location cannot be matched
                 matched_city = None
+                city_player_candidates = []
+                expected_city_norm = normalize_text(expected_city)
+                expected_player_norm = normalize_text(expected_player)
+
                 for c in cities_on_island:
-                    if c.get('name', '').strip().lower() == expected_city.lower():
-                        matched_city = c
-                        break
+                    city_name_norm = normalize_text(c.get('name', ''))
+                    player_name_norm = normalize_text(c.get('Name', ''))
+                    if city_name_norm == expected_city_norm and player_name_norm == expected_player_norm:
+                        city_player_candidates.append(c)
+
+                if city_player_candidates:
+                    expected_loc_norm = normalize_text(expected_location)
+                    if expected_loc_norm != "":
+                        for c in city_player_candidates:
+                            loc = get_city_location_token(c)
+                            if normalize_text(loc) == expected_loc_norm:
+                                matched_city = c
+                                break
+                    # Optional fallback when location is unavailable or no location match found.
+                    if matched_city is None and len(city_player_candidates) == 1:
+                        matched_city = city_player_candidates[0]
 
                 if matched_city is None:
                     mismatches.append(
@@ -2442,6 +2649,13 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters, inter
                     completed += 1
                     print(f"    SUCCESS ({completed}/{total})")
 
+                    # Mark row success immediately (every-row persistence for crash recovery).
+                    rows[row_num - 1][run_column] = "X"
+                    try:
+                        write_csv_atomic(csv_path, fieldnames, rows)
+                    except Exception as write_error:
+                        print(f"    WARNING: Shipment sent but failed to write checkpoint: {write_error}")
+
                     if telegram_enabled:
                         sendToBot(session, f"Mass Distribution [{completed}/{total}]\n{source_city['name']} -> {dest_name} ({player}) [{rx}:{ry}]\nResources: {resources_desc}\nStatus: Sent")
 
@@ -2455,7 +2669,8 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters, inter
 
             print(f"\n--- Mass Distribution complete: {completed}/{total} shipments sent ---")
             if telegram_enabled:
-                sendToBot(session, f"MASS DISTRIBUTION COMPLETE\nAccount: {session.username}\nSource: {source_city['name']}\nShipments: {completed}/{total} sent")
+                run_done = sum(1 for r in rows if normalize_text(r.get(run_column, "")) == "x")
+                sendToBot(session, f"MASS DISTRIBUTION COMPLETE\nAccount: {session.username}\nSource: {source_city['name']}\nRun Slot: {run_column[4:]}\nShipments this cycle: {completed}/{total} sent\nRun Progress: {run_done}/{len(rows)}")
 
         next_run = datetime.datetime.now() + datetime.timedelta(hours=interval_hours)
         print(f"\nNext run: {getDateTime(next_run.timestamp())}")
