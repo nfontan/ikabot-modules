@@ -30,7 +30,7 @@ from ikabot.helpers.varios import addThousandSeparator, getDateTime
 def print_module_banner(page_title=None):
     print("\n")
     print("\u2554" + "\u2550" * 58 + "\u2557")
-    print("\u2551            RESOURCE TRANSPORT MANAGER v5                  \u2551")
+    print("\u2551            RESOURCE TRANSPORT MANAGER v6                  \u2551")
     print("\u255a" + "\u2550" * 58 + "\u255d")
     if page_title:
         print(f"\n{page_title}")
@@ -93,12 +93,17 @@ LOG_COLUMNS = [
 
 
 def get_log_path(session, default_dir=None):
+    """Get path to the shared shipment log file.
+    All accounts write to the SAME file — the 'Account' column identifies
+    which account each row belongs to. Uses append mode so concurrent
+    accounts never overwrite each other's data.
+    """
     if default_dir is None:
         default_dir = os.path.expanduser("~")
-    safe = session.username.replace("/", "_").replace("\\", "_")
-    default_path = os.path.join(default_dir, f"shipment_log_{safe}.csv")
+    default_path = os.path.join(default_dir, "shipment_log.csv")
     print(f"Shipment log file (Enter for default):")
     print(f"  Default: {default_path}")
+    print(f"  (All accounts share one file — each row has an Account column)")
     user_path = read(msg="Log path: ", empty=True)
     if user_path.strip() == "":
         return default_path
@@ -344,23 +349,16 @@ def send_shipment(session, route, useFreighters, notif_config, log_path,
         session.setStatus(f"{prefix}Sending resources...")
         executeRoutes(session, [route], useFreighters)
 
-        ships_after = (
-            getAvailableFreighters(session) if useFreighters
-            else getAvailableShips(session)
-        )
+        # If executeRoutes completes without error, the shipment was sent.
+        # We do NOT verify by comparing ship counts before/after because
+        # ships from earlier shipments can return during sending, making
+        # the count unreliable and causing false "failure" reports.
         ship_cap, freighter_cap = getShipCapacity(session)
         capacity = freighter_cap if useFreighters else ship_cap
         ships_needed = math.ceil(total_cargo / capacity) if capacity > 0 else 0
-        ships_used = ships_before - ships_after
-
-        if ships_used < ships_needed:
-            raise Exception(
-                f"Expected {ships_needed} ships but only "
-                f"{ships_used} were used"
-            )
 
         result["success"] = True
-        result["ships_used"] = ships_used
+        result["ships_used"] = ships_needed
 
         res_desc = ", ".join(
             f"{addThousandSeparator(resources[i])} {materials_names[i]}"
