@@ -376,7 +376,7 @@ def send_shipment(session, route, useFreighters, notif_config, log_path,
         log_shipment(log_path, session, mode_name,
                      origin_city["name"], "", dest_city["name"],
                      dest_island_coords, dest_player, resources,
-                     ships_used, ship_type_name, "SENT",
+                     ships_needed, ship_type_name, "SENT",
                      next_shipment=next_shipment_str)
 
     except Exception as e:
