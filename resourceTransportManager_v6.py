@@ -91,23 +91,51 @@ LOG_COLUMNS = [
     "Ships_Used", "Ship_Type", "Status", "Error", "Next_Shipment",
 ]
 
+PREFS_FILE = os.path.join(os.path.expanduser("~"), ".ikabot_rtm_prefs.json")
 
-def get_log_path(session, default_dir=None):
+
+def load_prefs():
+    """Load saved preferences (log path, CSV path, etc.)."""
+    try:
+        if os.path.isfile(PREFS_FILE):
+            with open(PREFS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_prefs(prefs):
+    """Save preferences to disk."""
+    try:
+        with open(PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+    except Exception:
+        pass
+
+
+def get_log_path(session):
     """Get path to the shared shipment log file.
-    All accounts write to the SAME file — the 'Account' column identifies
-    which account each row belongs to. Uses append mode so concurrent
-    accounts never overwrite each other's data.
+    Remembers the last-used path so you can just press Enter next time.
     """
-    if default_dir is None:
-        default_dir = os.path.expanduser("~")
-    default_path = os.path.join(default_dir, "shipment_log.csv")
+    prefs = load_prefs()
+    saved = prefs.get("log_path", "")
+    fallback = os.path.join(os.path.expanduser("~"), "shipment_log.csv")
+    default_path = saved if saved else fallback
+
+    if saved:
+        # Already have a saved path — use it silently
+        print(f"  Shipment log: {default_path}")
+        return default_path
+    # First time — ask the user
     print(f"Shipment log file (Enter for default):")
     print(f"  Default: {default_path}")
     print(f"  (All accounts share one file — each row has an Account column)")
     user_path = read(msg="Log path: ", empty=True)
-    if user_path.strip() == "":
-        return default_path
-    return user_path.strip()
+    chosen = user_path.strip() if user_path.strip() else default_path
+    prefs["log_path"] = chosen
+    save_prefs(prefs)
+    return chosen
 
 
 def log_shipment(log_path, session, mode, source_city, source_island,
@@ -1895,14 +1923,28 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
                          telegram_enabled, log_path):
     try:
         print_module_banner("Mass Distribution")
-        print("Enter the full path to your CSV file:")
+        prefs = load_prefs()
+        saved_csv = prefs.get("csv_path", "")
+        if saved_csv:
+            print(f"CSV file (Enter to reuse last: {saved_csv}):")
+        else:
+            print("Enter the full path to your CSV file:")
         print("(Columns: X, Y, Player, City, City_Location, "
               "Wood, Wine, Marble, Crystal, Sulphur, Hours)")
         print("(') Back to main menu\n")
-        csv_path = read(msg="CSV path: ", additionalValues=["'"])
-        if csv_path == "'":
+        csv_input = read(msg="CSV path: ", empty=True, additionalValues=["'"])
+        if csv_input == "'":
             event.set()
             return
+        csv_path = csv_input.strip() if csv_input.strip() else saved_csv
+        if not csv_path:
+            print("No CSV path provided.")
+            enter()
+            event.set()
+            return
+        # Save for next time
+        prefs["csv_path"] = csv_path
+        save_prefs(prefs)
 
         if not os.path.isfile(csv_path):
             print(f"File not found: {csv_path}")
