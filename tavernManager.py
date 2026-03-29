@@ -346,8 +346,8 @@ def _print_results_table(results):
         'OK':      bcolors.GREEN,
         'CHANGED': bcolors.BLUE,
         'WARN':    bcolors.WARNING,
-        'SKIP':    '',
-        'ERROR':   bcolors.FAIL,
+        'SKIP':    bcolors.STONE,
+        'ERROR':   bcolors.RED,
     }
 
     header = f"{'City':<{col_city}}  {'Status':<7}  {'Pop':<11}  {'Sat':>5}  Note"
