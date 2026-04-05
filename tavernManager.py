@@ -56,7 +56,7 @@ class TavernManager:
             if item[0] == "changeView" and isinstance(item[1], list) and len(item[1]) >= 2:
                 tavern_html = item[1][1]
                 dropdown_pattern = re.findall(
-                    r'<option[^>]*value="(\d+)"[^>]*>(\d+)\s+Wine per hour', tavern_html
+                    r'<option[^>]*value="(\d+)"[^>]*>(\d+)', tavern_html
                 )
                 for level_str, wine_str in dropdown_pattern:
                     consumption_values.append((int(level_str), int(wine_str)))
@@ -110,7 +110,7 @@ class TavernManager:
             (b['position'] for b in city_data['position'] if b['building'] == 'townHall'),
             None
         )
-        if not town_hall_position:
+        if town_hall_position is None:
             return None
 
         th_params = {
@@ -137,7 +137,7 @@ class TavernManager:
         if not th_html:
             return None
 
-        growth_match = re.search(r'id="js_TownHallPopulationGrowthValue">([0-9.-]+)', th_html)
+        growth_match = re.search(r'id="js_TownHallPopulationGrowthValue">([0-9,.-]+)', th_html)
         satisfaction_match = re.search(
             r'id="js_TownHallHappinessLargeValue"[^>]*>([0-9,.-]+)', th_html
         )
@@ -149,9 +149,17 @@ class TavernManager:
             re.search(r'class="[^"]*shortage[^"]*"', th_html, re.IGNORECASE)
         )
 
+        growth_str = growth_match.group(1).strip()
+        if ',' in growth_str and '.' not in growth_str:
+            growth_str = growth_str.replace(',', '.')
+        elif ',' in growth_str:
+            growth_str = growth_str.replace(',', '')
+
+        sat_str = re.sub(r'[^\d]', '', satisfaction_match.group(1))
+
         return {
-            'growth_rate': float(growth_match.group(1)),
-            'total_satisfaction': int(satisfaction_match.group(1).replace(',', '')),
+            'growth_rate': float(growth_str),
+            'total_satisfaction': int(sat_str) if sat_str else 0,
             'resource_shortage': resource_shortage,
         }
 
@@ -214,8 +222,8 @@ class TavernManager:
                     continue
 
                 citizens_match = re.search(
-                    r'id="js_GlobalMenu_citizens">([0-9,]+)</span>[^<]*'
-                    r'<[^>]*id="js_GlobalMenu_population">([0-9,]+)',
+                    r'id="js_GlobalMenu_citizens">([0-9,.]+)</span>[^<]*'
+                    r'<[^>]*id="js_GlobalMenu_population">([0-9,.]+)',
                     html
                 )
 
@@ -224,8 +232,8 @@ class TavernManager:
                     results.append(result)
                     continue
 
-                current_citizens = int(citizens_match.group(1).replace(',', ''))
-                max_citizens = int(citizens_match.group(2).replace(',', ''))
+                current_citizens = int(re.sub(r'[^\d]', '', citizens_match.group(1)))
+                max_citizens = int(re.sub(r'[^\d]', '', citizens_match.group(2)))
                 result['pop'] = f"{current_citizens}/{max_citizens}"
 
                 tavern_data = self._get_tavern_data(city, tavern)
@@ -289,7 +297,7 @@ class TavernManager:
 
             except Exception as e:
                 result.update({'status': 'ERROR', 'note': str(e)})
-                if self.notification_mode <= 2:
+                if self.notification_mode in (1, 2):
                     sendToBot(self.session, f"❌ Tavern Equilibrium Error\n{city['name']}: {str(e)}")
 
             results.append(result)
@@ -567,7 +575,7 @@ def _run_equilibrium_mode(session, event, stdin_fd, predetermined_input):
             session.setStatus(f"Equilibrium check @{getDateTime()}")
     except Exception as e:
         msg = f"Error in:\n{info}\nCause:\n{traceback.format_exc()}"
-        if notification_mode <= 2:
+        if notification_mode in (1, 2):
             sendToBot(session, msg)
     finally:
         session.logout()
