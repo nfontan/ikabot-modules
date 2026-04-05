@@ -137,9 +137,9 @@ class TavernManager:
         if not th_html:
             return None
 
-        growth_match = re.search(r'id="js_TownHallPopulationGrowthValue">([0-9,.-]+)', th_html)
+        growth_match = re.search(r'id="js_TownHallPopulationGrowthValue">([0-9,.\xa0\s-]+)', th_html)
         satisfaction_match = re.search(
-            r'id="js_TownHallHappinessLargeValue"[^>]*>([0-9,.-]+)', th_html
+            r'id="js_TownHallHappinessLargeValue"[^>]*>([0-9,.\xa0\s-]+)', th_html
         )
 
         if not growth_match or not satisfaction_match:
@@ -150,15 +150,18 @@ class TavernManager:
         )
 
         growth_str = growth_match.group(1).strip()
+        # Strip non-breaking and regular spaces (thousands separators in some locales)
+        growth_str = growth_str.replace('\xa0', '').replace(' ', '')
+        # Normalise decimal separator: comma-as-decimal vs comma-as-thousands
         if ',' in growth_str and '.' not in growth_str:
             growth_str = growth_str.replace(',', '.')
-        elif ',' in growth_str:
+        else:
             growth_str = growth_str.replace(',', '')
 
         sat_str = re.sub(r'[^\d]', '', satisfaction_match.group(1))
 
         return {
-            'growth_rate': float(growth_str),
+            'growth_rate': float(growth_str) if growth_str and growth_str not in ('-', '.') else 0.0,
             'total_satisfaction': int(sat_str) if sat_str else 0,
             'resource_shortage': resource_shortage,
         }
@@ -222,8 +225,8 @@ class TavernManager:
                     continue
 
                 citizens_match = re.search(
-                    r'id="js_GlobalMenu_citizens">([0-9,.]+)</span>[^<]*'
-                    r'<[^>]*id="js_GlobalMenu_population">([0-9,.]+)',
+                    r'id="js_GlobalMenu_citizens">([0-9,.\xa0\s]+)</span>[^<]*'
+                    r'<[^>]*id="js_GlobalMenu_population">([0-9,.\xa0\s]+)',
                     html
                 )
 
