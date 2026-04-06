@@ -639,6 +639,66 @@ def apply_dest_minimums(sendable, dest_current, minimum):
 
 
 # ============================================================================
+#  CITY SELECTION HELPERS  (show full resource names + coordinates)
+# ============================================================================
+
+_TRADEGOOD_NAMES = {1: "Wine", 2: "Marble", 3: "Crystal", 4: "Sulphur"}
+
+
+def _format_city_line(index, city, longest_name):
+    """Format a single city line with name, resource, and coordinates."""
+    name = city["name"]
+    pad = " " * (longest_name - len(name) + 2)
+    resource = _TRADEGOOD_NAMES.get(int(city.get("tradegood", 0)), "???")
+    coords = city.get("coords", "").strip()
+    return f"{index: >2}: {name}{pad}{resource:<9} {coords}"
+
+
+def rtm_chooseCity(session):
+    """Replacement for chooseCity that shows full resource names + coords."""
+    (ids, cities) = getIdsOfCities(session)
+    longest = max(len(cities[cid]["name"]) for cid in ids)
+    print("")
+    for i, city_id in enumerate(ids, 1):
+        print(_format_city_line(i, cities[city_id], longest))
+    selected = read(min=1, max=len(ids))
+    html = session.get(city_url + ids[selected - 1])
+    return getCity(html)
+
+
+def rtm_ignoreCities(session, msg=None):
+    """Replacement for ignoreCities that shows full resource names + coords."""
+    (cities_ids, cities) = getIdsOfCities(session)
+    ignored_cities = []
+    while True:
+        banner()
+        if msg is not None:
+            print(f"{msg}")
+        if ignored_cities:
+            print(f'(currently ignoring: {", ".join(ignored_cities)})')
+        print("0) Continue")
+        longest = max(len(cities[cid]["name"]) for cid in cities_ids) if cities_ids else 0
+        choice_to_cityid_map = []
+        for i, city_id in enumerate(cities_ids, 1):
+            city = cities[city_id]
+            choice_to_cityid_map.append(city["id"])
+            name = city["name"]
+            pad = " " * (longest - len(name) + 2)
+            resource = _TRADEGOOD_NAMES.get(int(city.get("tradegood", 0)), "???")
+            coords = city.get("coords", "").strip()
+            print(f"{i}) {name}{pad}{resource:<9} {coords}")
+        choice = read(min=0, max=len(cities_ids))
+        if choice == 0:
+            break
+        city_id = choice_to_cityid_map[choice - 1]
+        cities_ids = list(filter(lambda x: x != str(city_id), cities_ids))
+        ignored_cities.append(cities[str(city_id)]["name"])
+        del cities[str(city_id)]
+
+    return cities_ids, cities
+
+
+# ============================================================================
 #  DRY RUN PREVIEW
 # ============================================================================
 
@@ -761,12 +821,12 @@ def consolidateMode(session, event, stdin_fd, predetermined_input,
         if source_option == 1:
             print_module_banner("Single Source City")
             print("Select source city:")
-            origin_city = chooseCity(session)
+            origin_city = rtm_chooseCity(session)
             origin_cities.append(origin_city)
         else:
             print_module_banner("Multiple Source Cities")
             source_msg = "Select source cities (cities to send resources from):"
-            source_city_ids, _ = ignoreCities(session, msg=source_msg)
+            source_city_ids, _ = rtm_ignoreCities(session, msg=source_msg)
             if not source_city_ids:
                 print("No cities selected!")
                 enter()
@@ -900,7 +960,7 @@ def consolidateMode(session, event, stdin_fd, predetermined_input,
             # Internal city
             print_module_banner("Internal City Selection")
             print("Select destination city:\n")
-            destination_city = chooseCity(session)
+            destination_city = rtm_chooseCity(session)
             html = session.get(city_url + str(destination_city["id"]))
             destination_city = getCity(html)
             island_id = destination_city["islandId"]
@@ -1146,13 +1206,13 @@ def distributeMode(session, event, stdin_fd, predetermined_input,
 
         print_module_banner("Source City Selection")
         print("Select source city:\n")
-        origin_city = chooseCity(session)
+        origin_city = rtm_chooseCity(session)
 
         banner()
         print(f"Source city: {origin_city['name']}")
         print("Note: Source city auto-excluded from destinations\n")
         dest_msg = "Select destination cities (cities to receive resources):"
-        dest_ids, _ = ignoreCities(session, msg=dest_msg)
+        dest_ids, _ = rtm_ignoreCities(session, msg=dest_msg)
 
         src_id = str(origin_city["id"])
         if src_id in dest_ids:
@@ -1419,7 +1479,7 @@ def evenDistributionMode(session, event, stdin_fd, predetermined_input,
         print_module_banner("City Selection")
         print(f"Balancing: {selected_names}\n")
         print("Select cities to EXCLUDE from balancing:")
-        excluded_ids, _ = ignoreCities(session, msg="Select cities to EXCLUDE:")
+        excluded_ids, _ = rtm_ignoreCities(session, msg="Select cities to EXCLUDE:")
 
         html = session.get()
         city_ids = re.findall(r'<option value="(\d+)" class="cityowntown"', html)
@@ -1650,7 +1710,7 @@ def autoSendMode(session, event, stdin_fd, predetermined_input,
         while True:
             print_module_banner("Auto Send")
             print("Select the city to send resources TO:\n")
-            destination_city = chooseCity(session)
+            destination_city = rtm_chooseCity(session)
 
             html = session.get(island_url + destination_city["islandId"])
             destination_island = getIsland(html)
@@ -2029,7 +2089,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
 
         print_module_banner("Mass Distribution")
         print("Select the SOURCE city:\n")
-        source_city = chooseCity(session)
+        source_city = rtm_chooseCity(session)
 
         # Notifications
         notif_config = get_notification_config(telegram_enabled, event)
