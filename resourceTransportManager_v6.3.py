@@ -393,7 +393,7 @@ def send_shipment(session, route, useFreighters, notif_config, log_path,
             for i in range(len(materials_names))
             if i < len(resources) and resources[i] > 0
         )
-        if should_notify(notif_config, "each"):
+        if should_notify(notif_config, "all"):
             sendToBot(session,
                       f"SHIPMENT SENT\nAccount: {session.username}\n"
                       f"From: {origin_city['name']}\n"
@@ -657,6 +657,9 @@ def _format_city_line(index, city, longest_name):
 def rtm_chooseCity(session):
     """Replacement for chooseCity that shows full resource names + coords."""
     (ids, cities) = getIdsOfCities(session)
+    if not ids:
+        print("No cities available!")
+        return None
     longest = max(len(cities[cid]["name"]) for cid in ids)
     print("")
     for i, city_id in enumerate(ids, 1):
@@ -671,12 +674,12 @@ def rtm_ignoreCities(session, msg=None):
     (cities_ids, cities) = getIdsOfCities(session)
     ignored_cities = []
     while True:
-        banner()
+        print_module_banner()
         if msg is not None:
             print(f"{msg}")
         if ignored_cities:
             print(f'(currently ignoring: {", ".join(ignored_cities)})')
-        print("0) Continue")
+        print("(0) Continue")
         longest = max(len(cities[cid]["name"]) for cid in cities_ids) if cities_ids else 0
         choice_to_cityid_map = []
         for i, city_id in enumerate(cities_ids, 1):
@@ -1208,7 +1211,7 @@ def distributeMode(session, event, stdin_fd, predetermined_input,
         print("Select source city:\n")
         origin_city = rtm_chooseCity(session)
 
-        banner()
+        print_module_banner("Distribution Setup")
         print(f"Source city: {origin_city['name']}")
         print("Note: Source city auto-excluded from destinations\n")
         dest_msg = "Select destination cities (cities to receive resources):"
@@ -1230,7 +1233,7 @@ def distributeMode(session, event, stdin_fd, predetermined_input,
             html = session.get(city_url + cid)
             destination_cities.append(getCity(html))
 
-        banner()
+        print_module_banner("Distribution Setup")
         dest_summary = ", ".join(c["name"] for c in destination_cities)
         print(f"Source: {origin_city['name']}")
         print(f"Destinations: {dest_summary}\n")
@@ -1378,7 +1381,7 @@ def do_it_distribute(session, origin_city, destination_cities,
                     continue
                 avail = origin_fresh["availableResources"][i]
                 s = min(resource_config[i], avail)
-                dest_space = dc_fresh.get("freeSpaceForResources", [0]*5)
+                dest_space = dc_fresh.get("freeSpaceForResources", [0] * len(materials_names))
                 if i < len(dest_space):
                     s = min(s, dest_space[i])
                 if dest_minimums:
@@ -1465,7 +1468,7 @@ def evenDistributionMode(session, event, stdin_fd, predetermined_input,
         # Ship type
         print_module_banner("Ship Type Selection")
         print(f"Balancing: {selected_names}\n")
-        print("What type of ships?")
+        print("What type of ships do you want to use?")
         print("(1) Merchant ships")
         print("(2) Freighters")
         print("(') Back to main menu")
@@ -1561,11 +1564,11 @@ def evenDistributionMode(session, event, stdin_fd, predetermined_input,
         # Confirmation with dry run
         while True:
             print(f"\n{len(preview_routes)} shipment(s) planned.")
-            print("(1) Confirm - Start balancing")
+            print("(Y) Confirm - Start balancing")
             print("(D) Dry run - preview shipments")
-            print("(2) Cancel")
-            choice = read(values=["1", "2", "d", "D"])
-            if choice == "2":
+            print("(N) Cancel")
+            choice = read(values=["y", "Y", "n", "N", "d", "D", ""])
+            if choice.lower() == "n":
                 event.set()
                 return
             if choice.lower() == "d":
@@ -1697,7 +1700,7 @@ def autoSendMode(session, event, stdin_fd, predetermined_input,
                  telegram_enabled, log_path):
     try:
         print_module_banner("Auto Send")
-        print("What type of ships?")
+        print("What type of ships do you want to use?")
         print("(1) Merchant ships")
         print("(2) Freighters")
         print("(') Back to main menu")
@@ -1709,7 +1712,7 @@ def autoSendMode(session, event, stdin_fd, predetermined_input,
 
         while True:
             print_module_banner("Auto Send")
-            print("Select the city to send resources TO:\n")
+            print("Select the destination city:\n")
             destination_city = rtm_chooseCity(session)
 
             html = session.get(island_url + destination_city["islandId"])
@@ -2077,7 +2080,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
         print(f"CSV loaded: {len(rows)} rows")
         print(f"Interval: every {interval_hours} hour(s)")
         print(f"Run slot: {run_column[4:]}\n")
-        print("What type of ships?")
+        print("What type of ships do you want to use?")
         print("(1) Merchant ships")
         print("(2) Freighters")
         print("(') Back to main menu")
@@ -2088,7 +2091,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
         useFreighters = (shiptype == 2)
 
         print_module_banner("Mass Distribution")
-        print("Select the SOURCE city:\n")
+        print("Select the source city:\n")
         source_city = rtm_chooseCity(session)
 
         # Notifications
@@ -2105,7 +2108,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             print(f"  CSV rows: {len(rows)}")
             print(f"  Interval: every {interval_hours}h")
             print(f"  Run slot: {run_column[4:]}\n")
-            print("(Y) Proceed  (D) Dry run scan  (N) Cancel")
+            print("(Y) Proceed  (D) Dry run preview  (N) Cancel")
             rta = read(values=["y", "Y", "n", "N", "d", "D", "", "'"],
                        additionalValues=["'"])
             if rta == "'" or rta.lower() == "n":
@@ -2342,7 +2345,7 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 else:
                     print(f"    FAILED: {result['error']}")
 
-            print(f"\n--- Mass Dist: {completed}/{total} sent ---")
+            print(f"\n--- Mass Distribution complete: {completed}/{total} sent ---")
             if should_notify(notif_config, "complete"):
                 run_done = sum(
                     1 for r in rows
