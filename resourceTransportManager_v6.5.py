@@ -497,6 +497,23 @@ def get_city_location_token(city_data):
     return None
 
 
+def ensure_issues_column(fieldnames, rows):
+    """Add Issues column if missing (backward compatibility). Returns updated fieldnames."""
+    if "Issues" not in fieldnames:
+        insert_idx = len(fieldnames)
+        if "Hours" in fieldnames:
+            insert_idx = fieldnames.index("Hours") + 1
+        else:
+            for i, col in enumerate(fieldnames):
+                if col.startswith("Run_"):
+                    insert_idx = i
+                    break
+        fieldnames.insert(insert_idx, "Issues")
+        for row in rows:
+            row["Issues"] = ""
+    return fieldnames
+
+
 def choose_run_slot(session, event, rows, run_columns):
     print_module_banner("Mass Distribution - Run Slot")
     print("Choose how to start:")
@@ -1993,7 +2010,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
         else:
             print("Enter the full path to your CSV file:")
         print("(Columns: X, Y, Player, City, City_Location, "
-              "Wood, Wine, Marble, Crystal, Sulphur, Hours)")
+              "Wood, Wine, Marble, Crystal, Sulphur, Hours, Issues)")
         print("(') Back to main menu\n")
         csv_input = read(msg="CSV path: ", empty=True, additionalValues=["'"])
         if csv_input == "'":
@@ -2044,13 +2061,14 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             event.set()
             return
 
-        try:
-            interval_hours = int(str(rows[0].get("Hours", "")).strip())
-        except Exception:
-            print("Invalid Hours value in CSV row 1.")
+        hours_raw = str(rows[0].get("Hours", "")).strip()
+        hours_match = re.search(r"\d+", hours_raw)
+        if not hours_match:
+            print("Invalid Hours value in CSV row 1 (no number found).")
             enter()
             event.set()
             return
+        interval_hours = int(hours_match.group())
 
         if interval_hours <= 0:
             print("Hours must be >= 1 for Mass Distribution.")
@@ -2059,6 +2077,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             return
 
         fieldnames, run_columns = ensure_run_columns(fieldnames, rows)
+        fieldnames = ensure_issues_column(fieldnames, rows)
 
         mode, run_column = choose_run_slot(session, event, rows, run_columns)
         if run_column is None:
@@ -2160,6 +2179,8 @@ def _scan_csv_for_preview(session, rows, run_column, source_city):
     for row in rows:
         if normalize_text(row.get(run_column, "")) == "x":
             continue
+        if row.get("Issues", "").strip():
+            continue
         resources = []
         for col in csv_res_cols:
             val = row.get(col, "0").strip()
@@ -2213,14 +2234,20 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 time.sleep(3600)
                 continue
 
+        # Ensure Issues column exists and clear it for this cycle
+        fieldnames = ensure_issues_column(fieldnames, rows)
+        for row in rows:
+            row["Issues"] = ""
+
         mismatches = []
-        routes = []
+        validated_cities = {}
 
         session.setStatus(
-            f"[PROCESSING] Mass Distribution | "
-            f"Scanning {len(rows)} rows..."
+            f"[PRE-SCAN] Mass Distribution | "
+            f"Validating {len(rows)} rows..."
         )
 
+        # ---- PHASE 1: Pre-scan validation ----
         for row_num, row in enumerate(rows, start=1):
             try:
                 if normalize_text(row.get(run_column, "")) == "x":
@@ -2230,7 +2257,14 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 y = row["Y"].strip()
                 expected_player = row["Player"].strip()
                 expected_city = row["City"].strip()
-                expected_location = str(row["City_Location"].strip())
+                expected_location = str(row.get("City_Location", "")).strip()
+
+                resources = []
+                for col in csv_resource_cols:
+                    val = row.get(col, "0").strip()
+                    resources.append(int(val) if val.isdigit() else 0)
+                if sum(resources) == 0:
+                    continue
 
                 html = session.get(
                     f"view=island&xcoord={x}&ycoord={y}"
@@ -2265,38 +2299,75 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                         matched_city = candidates[0]
 
                 if matched_city is None:
-                    mismatches.append(
-                        f"Row {row_num}: [{x}:{y}] "
-                        f"{expected_player}/{expected_city}"
-                    )
+                    issue = (f"City not found: {expected_player}/"
+                             f"{expected_city} at [{x}:{y}]")
+                    row["Issues"] = issue
+                    mismatches.append(f"Row {row_num}: {issue}")
                     continue
 
-                resources = []
-                for col in csv_resource_cols:
-                    val = row.get(col, "0").strip()
-                    resources.append(int(val) if val.isdigit() else 0)
+                # Auto-fill City_Location if empty
+                if not expected_location:
+                    loc_token = get_city_location_token(matched_city)
+                    if loc_token:
+                        row["City_Location"] = loc_token
 
-                if sum(resources) == 0:
-                    continue
+                validated_cities[row_num] = (matched_city, island)
 
+            except Exception as e:
+                issue = f"Error: {e}"
+                row["Issues"] = issue
+                mismatches.append(f"Row {row_num}: {issue}")
+
+        # Save CSV after pre-scan (persists Issues + City_Location auto-fills)
+        try:
+            write_csv_atomic(csv_path, fieldnames, rows)
+        except Exception as we:
+            print(f"    WARNING: pre-scan CSV write failed: {we}")
+
+        if mismatches and should_notify(notif_config, "error"):
+            sendToBot(session,
+                      f"MASS DIST ISSUES\n"
+                      + "\n".join(mismatches))
+
+        # ---- PHASE 2: Build routes from validated rows ----
+        routes = []
+        session.setStatus(
+            f"[PROCESSING] Mass Distribution | "
+            f"Building {len(validated_cities)} route(s)..."
+        )
+
+        for row_num, row in enumerate(rows, start=1):
+            if normalize_text(row.get(run_column, "")) == "x":
+                continue
+            if row_num not in validated_cities:
+                continue
+
+            matched_city, island = validated_cities[row_num]
+            resources = []
+            for col in csv_resource_cols:
+                val = row.get(col, "0").strip()
+                resources.append(int(val) if val.isdigit() else 0)
+            if sum(resources) == 0:
+                continue
+
+            x = row["X"].strip()
+            y = row["Y"].strip()
+            expected_player = row["Player"].strip()
+
+            try:
                 dest_html = session.get(city_url + str(matched_city["id"]))
                 dest_city = getCity(dest_html)
-
                 route = (source_city, dest_city, island["id"], *resources)
                 routes.append((
                     row_num, route, resources, dest_city["name"],
                     expected_player, x, y
                 ))
-
             except Exception as e:
-                mismatches.append(
-                    f"Row {row_num}: Error: {e}"
-                )
-
-        if mismatches and should_notify(notif_config, "error"):
-            sendToBot(session,
-                      f"MASS DIST MISMATCHES\n"
-                      + "\n".join(mismatches))
+                row["Issues"] = f"Error fetching city details: {e}"
+                try:
+                    write_csv_atomic(csv_path, fieldnames, rows)
+                except Exception:
+                    pass
 
         if not routes:
             if should_notify(notif_config, "error"):
