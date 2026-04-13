@@ -50,6 +50,7 @@ def _get_island_id(session, x, y):
     except: return None
 
 def _get_fresh_context(session, city_id, island_id, x, y, position):
+    """Mantiene la navegación estable para evitar 'Waiting for data'."""
     session.get("view=city&currentCityId={}&ajax=1".format(city_id), noIndex=True)
     url = (
         "view=colonize&islandId={}&position={}"
@@ -85,14 +86,20 @@ def _get_valid_empty_slots(bg, allow_premium):
     return sorted(set(empties))
 
 # =========================================================
-# ATOMIC ACTION (POS 1)
+# ACCIÓN ATÓMICA (POSICIÓN - 1)
 # =========================================================
 
-def _do_colonize(session, origin_id, island_id, x, y):
+def _do_colonize(session, origin_id, island_id, x, y, detected_pos):
+    """
+    Ejecuta la colonización aplicando el desfase de -1 sobre la posición detectada.
+    """
     url_base = session.urlBase.replace("index.php?", "index.php")
     
-    # Obtenemos token pidiendo la posición 1
-    token, _ = _get_fresh_context(session, origin_id, island_id, x, y, 1)
+    # Aplicamos el desfase solicitado
+    target_pos = detected_pos - 1
+    
+    # Obtenemos token para la posición real a enviar
+    token, _ = _get_fresh_context(session, origin_id, island_id, x, y, target_pos)
     if not token:
         return False
 
@@ -107,13 +114,13 @@ def _do_colonize(session, origin_id, island_id, x, y):
         "islandId": str(island_id),
         "cargo_people": str(CARGO_PEOPLE),
         "cargo_gold": str(CARGO_GOLD),
-        "desiredPosition": "1", 
+        "desiredPosition": str(target_pos), 
         "actionRequest": str(token),
         "resource": "0", "tradegood1": "0", "tradegood2": "0",
         "tradegood3": "0", "tradegood4": "0",
         "capacity": str(CAPACITY), "max_capacity": str(CAPACITY),
         "jetPropulsion": "0", "transporters": str(TRANSPORTERS),
-        "position": "1",
+        "position": str(target_pos),
         "destinationIslandId": str(island_id),
         "backgroundView": "island", "currentIslandId": str(island_id),
         "templateView": "colonize", "ajax": "1",
@@ -133,7 +140,7 @@ def _do_colonize(session, origin_id, island_id, x, y):
 
 def _watch(session, island_id, x, y, origin_id, origin_name, allow_premium):
     print(f"\nMonitoring island [{x}:{y}]... (Ctrl+C to stop)")
-    _log(f"Monitoring started from {origin_name} to island [{x}:{y}]")
+    _log(f"Watch started from {origin_name} with offset -1 logic.")
 
     while True:
         try:
@@ -148,19 +155,20 @@ def _watch(session, island_id, x, y, origin_id, origin_name, allow_premium):
             valid_empties = _get_valid_empty_slots(bg, allow_premium)
 
             if valid_empties:
-                print(f"\n{ts} [!] SPACE DETECTED: Slot {valid_empties[0]} is now free!")
-                _log(f"Free space detected at [{x}:{y}]. Sending colonization mission...")
+                detected_pos = valid_empties[0]
+                print(f"\n{ts} [!] SPACE DETECTED: Slot {detected_pos} is now free!")
+                _log(f"Detected free slot at pos {detected_pos}. Applying offset -1...")
                 
-                if _do_colonize(session, origin_id, island_id, x, y):
-                    msg = f"SUCCESS: Colonization mission sent to [{x}:{y}] from {origin_name}"
+                # Intentamos colonizar en la posición ajustada
+                if _do_colonize(session, origin_id, island_id, x, y, detected_pos):
+                    msg = f"SUCCESS: Mission sent to pos {detected_pos-1} (Detected: {detected_pos}) at [{x}:{y}]"
                     print("\n" + msg)
                     _log(msg)
                     try: sendToBot(session, msg)
                     except: pass
                     return 
                 else:
-                    print(f"\n{ts} - Mission rejected by server. Resuming vigilance...")
-                    _log("Mission rejected. Possible conflict or insufficient resources.")
+                    print(f"\n{ts} - Mission rejected. Possible offset mismatch. Resuming scan...")
             else:
                 print(f"\r{ts} - Island full. Watching [{x}:{y}]...", end="", flush=True)
             
@@ -199,7 +207,7 @@ def autoColonize(session, event, stdin_fd, predetermined_input):
             return
         
         print(f"\nOrigin City: {origin_name}")
-        print(f"Target Island: [{x}:{y}] (ID: {island_id})")
+        print(f"Target Island: [{x}:{y}]")
         
         set_child_mode(session)
         setInfoSignal(session, f"AutoColonize: {origin_name} -> [{x}:{y}]")
