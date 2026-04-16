@@ -7,6 +7,7 @@ import datetime
 import json
 import math
 import os
+import random
 import re
 import csv
 import tempfile
@@ -291,7 +292,7 @@ def wait_for_ships(session, useFreighters, status_prefix="", max_wait=3600):
         session.setStatus(
             f"{status_prefix}Waiting for {ship_type}... ({elapsed}s)"
         )
-        time.sleep(120)
+        time.sleep(20 + random.randint(-5, 5))
 
 
 # ============================================================================
