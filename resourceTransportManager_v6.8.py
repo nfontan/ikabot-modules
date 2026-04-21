@@ -31,7 +31,7 @@ from ikabot.helpers.varios import addThousandSeparator, getDateTime
 def print_module_banner(page_title=None):
     print("\n")
     print("\u2554" + "\u2550" * 58 + "\u2557")
-    print("\u2551            RESOURCE TRANSPORT MANAGER v6.7                  \u2551")
+    print("\u2551            RESOURCE TRANSPORT MANAGER v6.8                  \u2551")
     print("\u255a" + "\u2550" * 58 + "\u255d")
     if page_title:
         print(f"\n{page_title}")
@@ -496,6 +496,66 @@ def get_city_location_token(city_data):
         if key in city_data and str(city_data.get(key, "")).strip() != "":
             return str(city_data.get(key)).strip()
     return None
+
+
+def ensure_from_column(fieldnames, rows):
+    """Add From column after Sulphur if missing (backward compatibility)."""
+    if "From" not in fieldnames:
+        insert_idx = len(fieldnames)
+        if "Sulphur" in fieldnames:
+            insert_idx = fieldnames.index("Sulphur") + 1
+        else:
+            for i, col in enumerate(fieldnames):
+                if col in ("Hours", "Issues") or col.startswith("Run_"):
+                    insert_idx = i
+                    break
+        fieldnames.insert(insert_idx, "From")
+        for row in rows:
+            row["From"] = ""
+    return fieldnames
+
+
+def parse_from_column(val):
+    """Parse From column: '' -> None, 'a' -> 'all', '1,3,5' -> [1,3,5]."""
+    val = val.strip()
+    if not val:
+        return None
+    if val.lower() == "a":
+        return "all"
+    indices = []
+    for part in val.split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) >= 1:
+            indices.append(int(part))
+    return indices if indices else None
+
+
+def get_source_cities_for_row(session, from_val, fallback_city, city_cache):
+    """Return list of (city_index, city_obj) for a row's From value.
+    city_cache is a dict with keys 'ids' and 'objects' to avoid redundant fetches."""
+    if from_val is None:
+        return [(0, fallback_city)]
+
+    if "ids" not in city_cache:
+        ids, cities_map = getIdsOfCities(session)
+        city_cache["ids"] = ids
+        city_cache["map"] = cities_map
+
+    ids = city_cache["ids"]
+
+    if from_val == "all":
+        target_indices = list(range(1, len(ids) + 1))
+    else:
+        target_indices = [i for i in from_val if 1 <= i <= len(ids)]
+
+    result = []
+    for idx in target_indices:
+        city_id = ids[idx - 1]
+        if city_id not in city_cache.get("objects", {}):
+            html = session.get(city_url + city_id)
+            city_cache.setdefault("objects", {})[city_id] = getCity(html)
+        result.append((idx, city_cache["objects"][city_id]))
+    return result
 
 
 def ensure_issues_column(fieldnames, rows):
@@ -2041,9 +2101,11 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
         else:
             print("Enter the full path to your CSV file:")
         print("(Columns: X, Y, Player, City, City_Location, "
-              "Wood, Wine, Marble, Crystal, Sulphur, Hours, Issues)")
+              "Wood, Wine, Marble, Crystal, Sulphur, From, Hours, Issues)")
         print("(Resource values: 500 = send 500, e0 = send all, "
               "e10000 = send all except 10k)")
+        print("(From: a = all cities, 1,3,5 = specific cities, "
+              "empty = default source city)")
         print("(') Back to main menu\n")
         csv_input = read(msg="CSV path: ", empty=True, additionalValues=["'"])
         if csv_input == "'":
@@ -2110,6 +2172,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             return
 
         fieldnames, run_columns = ensure_run_columns(fieldnames, rows)
+        fieldnames = ensure_from_column(fieldnames, rows)
         fieldnames = ensure_issues_column(fieldnames, rows)
 
         mode, run_column = choose_run_slot(session, event, rows, run_columns)
@@ -2221,8 +2284,15 @@ def _scan_csv_for_preview(session, rows, run_column, source_city):
         resources = [amt for _, amt in parsed]
         city_name = row.get("City", "?")
         player = row.get("Player", "?")
+        from_val = parse_from_column(row.get("From", ""))
+        if from_val is None:
+            src_label = source_city["name"]
+        elif from_val == "all":
+            src_label = "All cities"
+        else:
+            src_label = f"Cities {','.join(str(i) for i in from_val)}"
         preview.append({
-            "source": source_city["name"],
+            "source": src_label,
             "dest": f"{city_name} ({player})",
             "resources": resources,
         })
@@ -2266,11 +2336,13 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 time.sleep(3600)
                 continue
 
-        # Ensure Issues column exists and clear it for this cycle
+        # Ensure From and Issues columns exist; clear Issues for this cycle
+        fieldnames = ensure_from_column(fieldnames, rows)
         fieldnames = ensure_issues_column(fieldnames, rows)
         for row in rows:
             row["Issues"] = ""
 
+        city_cache = {}
         mismatches = []
         validated_cities = {}
 
@@ -2282,7 +2354,8 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
         # ---- PHASE 1: Pre-scan validation ----
         for row_num, row in enumerate(rows, start=1):
             try:
-                if normalize_text(row.get(run_column, "")) == "x":
+                run_val = normalize_text(row.get(run_column, ""))
+                if run_val == "x":
                     continue
 
                 x = row["X"].strip()
@@ -2295,6 +2368,20 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 has_resources = any(amt > 0 or mode == "except" for mode, amt in parsed_resources)
                 if not has_resources:
                     continue
+
+                from_val = parse_from_column(row.get("From", ""))
+                if isinstance(from_val, list):
+                    if "ids" not in city_cache:
+                        ids_tmp, map_tmp = getIdsOfCities(session)
+                        city_cache["ids"] = ids_tmp
+                        city_cache["map"] = map_tmp
+                    max_idx = len(city_cache["ids"])
+                    bad = [str(i) for i in from_val if i > max_idx]
+                    if bad:
+                        issue = f"From: city index {','.join(bad)} out of range (max {max_idx})"
+                        row["Issues"] = issue
+                        mismatches.append(f"Row {row_num}: {issue}")
+                        continue
 
                 html = session.get(
                     f"view=island&xcoord={x}&ycoord={y}"
@@ -2363,51 +2450,66 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
         routes = []
         session.setStatus(
             f"[PROCESSING] Mass Distribution | "
-            f"Building {len(validated_cities)} route(s)..."
+            f"Building routes for {len(validated_cities)} row(s)..."
         )
 
-        has_except_rows = any(
-            any(parse_resource_value(rows[rn - 1].get(col, "0"))[0] == "except"
-                for col in csv_resource_cols)
-            for rn in validated_cities
-        )
-        if has_except_rows:
-            source_html = session.get(city_url + str(source_city["id"]))
-            source_city = getCity(source_html)
+        # Refresh city cache for "except" resolution
+        city_cache.pop("objects", None)
 
         for row_num, row in enumerate(rows, start=1):
-            if normalize_text(row.get(run_column, "")) == "x":
+            run_val = normalize_text(row.get(run_column, ""))
+            if run_val == "x":
                 continue
             if row_num not in validated_cities:
                 continue
 
             matched_city, island = validated_cities[row_num]
-            parsed_resources = [parse_resource_value(row.get(col, "0")) for col in csv_resource_cols]
-            resources = resolve_resources(
-                parsed_resources, source_city.get("availableResources", []),
-                row, csv_resource_cols
-            )
-            if sum(resources) == 0:
-                continue
-
             x = row["X"].strip()
             y = row["Y"].strip()
             expected_player = row["Player"].strip()
+            parsed_resources = [parse_resource_value(row.get(col, "0")) for col in csv_resource_cols]
+
+            from_val = parse_from_column(row.get("From", ""))
+            try:
+                src_cities = get_source_cities_for_row(
+                    session, from_val, source_city, city_cache
+                )
+            except Exception as e:
+                row["Issues"] = f"Error resolving source cities: {e}"
+                continue
+
+            done_indices = set()
+            if run_val and run_val != "x":
+                for p in run_val.split(","):
+                    p = p.strip()
+                    if p.isdigit():
+                        done_indices.add(int(p))
 
             try:
                 dest_html = session.get(city_url + str(matched_city["id"]))
                 dest_city = getCity(dest_html)
-                route = (source_city, dest_city, island["id"], *resources)
-                routes.append((
-                    row_num, route, resources, dest_city["name"],
-                    expected_player, x, y
-                ))
             except Exception as e:
                 row["Issues"] = f"Error fetching city details: {e}"
                 try:
                     write_csv_atomic(csv_path, fieldnames, rows)
                 except Exception:
                     pass
+                continue
+
+            for src_idx, src_city in src_cities:
+                if src_idx in done_indices:
+                    continue
+                resources = resolve_resources(
+                    parsed_resources, src_city.get("availableResources", []),
+                    row, csv_resource_cols
+                )
+                if sum(resources) == 0:
+                    continue
+                route = (src_city, dest_city, island["id"], *resources)
+                routes.append((
+                    row_num, route, resources, dest_city["name"],
+                    expected_player, x, y, src_city["name"], src_idx
+                ))
 
         if not routes:
             if should_notify(notif_config, "error"):
@@ -2416,26 +2518,26 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
             if should_notify(notif_config, "start"):
                 sendToBot(session,
                           f"MASS DIST SCHEDULED\n"
-                          f"Source: {source_city['name']}\n"
+                          f"Default source: {source_city['name']}\n"
                           f"{len(routes)} shipment(s)")
 
             completed = 0
             total = len(routes)
 
             for idx, (row_num, route, resources, dest_name,
-                      player, rx, ry) in enumerate(routes):
+                      player, rx, ry, src_name, src_idx) in enumerate(routes):
                 res_desc = ", ".join(
                     f"{addThousandSeparator(resources[i])} "
                     f"{materials_names[i]}"
                     for i in range(len(materials_names))
                     if resources[i] > 0
                 )
-                print(f"\n  [{idx+1}/{total}] {source_city['name']} -> "
+                print(f"\n  [{idx+1}/{total}] {src_name} -> "
                       f"{dest_name} ({player}) [{rx}:{ry}]")
 
                 session.setStatus(
                     f"[SENDING] Mass Dist [{idx+1}/{total}] "
-                    f"-> {dest_name}"
+                    f"{src_name} -> {dest_name}"
                 )
 
                 coords = f"[{rx}:{ry}]"
@@ -2447,20 +2549,47 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 if result["success"]:
                     completed += 1
                     print(f"    SUCCESS ({completed}/{total})")
-                    # Checkpoint
-                    rows[row_num - 1][run_column] = "X"
+                    # Per-city checkpoint
+                    from_val = parse_from_column(rows[row_num - 1].get("From", ""))
+                    if from_val is None:
+                        rows[row_num - 1][run_column] = "X"
+                    else:
+                        cur = rows[row_num - 1].get(run_column, "").strip()
+                        done = set()
+                        if cur and cur.upper() != "X":
+                            for p in cur.split(","):
+                                p = p.strip()
+                                if p.isdigit():
+                                    done.add(int(p))
+                        done.add(src_idx)
+                        try:
+                            expected = get_source_cities_for_row(
+                                session, from_val, source_city, city_cache
+                            )
+                            expected_indices = {i for i, _ in expected}
+                        except Exception:
+                            expected_indices = done
+                        if done >= expected_indices:
+                            rows[row_num - 1][run_column] = "X"
+                        else:
+                            rows[row_num - 1][run_column] = ",".join(
+                                str(d) for d in sorted(done)
+                            )
                     try:
                         write_csv_atomic(csv_path, fieldnames, rows)
                     except Exception as we:
                         print(f"    WARNING: checkpoint write failed: {we}")
-                    # Re-fetch source city if upcoming routes use "except"
+                    # Re-fetch sent source city if upcoming routes use "except"
+                    sent_city_id = route[0]["id"]
                     if any(
                         any(parse_resource_value(rows[r[0] - 1].get(col, "0"))[0] == "except"
                             for col in csv_resource_cols)
                         for r in routes[idx + 1:]
+                        if str(r[1][0]["id"]) == str(sent_city_id)
                     ):
-                        source_html = session.get(city_url + str(source_city["id"]))
-                        source_city = getCity(source_html)
+                        city_cache.get("objects", {})[str(sent_city_id)] = getCity(
+                            session.get(city_url + str(sent_city_id))
+                        )
                 else:
                     print(f"    FAILED: {result['error']}")
 
@@ -2472,7 +2601,7 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 )
                 sendToBot(session,
                           f"MASS DIST COMPLETE\n"
-                          f"Source: {source_city['name']}\n"
+                          f"Default source: {source_city['name']}\n"
                           f"Slot: {run_column[4:]}\n"
                           f"Cycle: {completed}/{total}\n"
                           f"Progress: {run_done}/{len(rows)}")
