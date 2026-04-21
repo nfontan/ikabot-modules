@@ -882,8 +882,9 @@ def resourceTransportManager(session, event, stdin_fd, predetermined_input):
         print("(3) Even Distribution: Balance resources across cities")
         print("(4) Auto Send: Request resources, auto-collect from all")
         print("(5) Mass Distribution: Send from CSV file")
+        print("(6) Keep Topped Up: Automatically top up a city's resources")
         print("(') Back to main menu")
-        shipping_mode = read(min=1, max=5, digit=True, additionalValues=["'"])
+        shipping_mode = read(min=1, max=6, digit=True, additionalValues=["'"])
         if shipping_mode == "'":
             event.set()
             return
@@ -901,10 +902,14 @@ def resourceTransportManager(session, event, stdin_fd, predetermined_input):
         elif shipping_mode == 4:
             autoSendMode(session, event, stdin_fd, predetermined_input,
                          telegram_enabled, log_path)
-        else:
+        elif shipping_mode == 5:
             massDistributionMode(session, event, stdin_fd,
                                  predetermined_input, telegram_enabled,
                                  log_path)
+        else:
+            topUpMode(session, event, stdin_fd,
+                      predetermined_input, telegram_enabled,
+                      log_path)
 
     except KeyboardInterrupt:
         event.set()
@@ -2605,4 +2610,438 @@ def do_it_mass_distribution(session, csv_path, interval_hours,
         sleep_secs = max(
             0, (next_run - datetime.datetime.now()).total_seconds()
         )
+        time.sleep(sleep_secs)
+
+
+# ============================================================================
+#  MODE 6: KEEP TOPPED UP  (periodically fill destinations from sources)
+# ============================================================================
+
+def topUpMode(session, event, stdin_fd, predetermined_input,
+              telegram_enabled, log_path):
+    try:
+        # --- Step 1: Ship type ---
+        ship_confirmed = False
+        while not ship_confirmed:
+            print_module_banner("Ship Type Selection")
+            print("What type of ships do you want to use?")
+            print("(1) Merchant ships")
+            print("(2) Freighters")
+            print("(') Back to main menu")
+            shiptype = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if shiptype == "'":
+                event.set()
+                return
+            useFreighters = (shiptype == 2)
+            ship_label = "Freighters" if useFreighters else "Merchant ships"
+            print(f"\nShip type: {ship_label}")
+            print("(1) Confirm  (2) Re-enter  (') Back to main menu")
+            c = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if c == "'":
+                event.set()
+                return
+            if c == 1:
+                ship_confirmed = True
+
+        # --- Step 2: Destination cities (multi-destination loop) ---
+        destinations = []
+        adding_dests = True
+        while adding_dests:
+            dest_confirmed = False
+            while not dest_confirmed:
+                print_module_banner("Destination Selection")
+                if destinations:
+                    print("Current destinations: " +
+                          ", ".join(d["name"] for d in destinations))
+                    print("")
+                print("Select destination city:")
+                dest = rtm_chooseCity(session)
+                if dest is None:
+                    event.set()
+                    return
+                print(f"\nSelected: {dest['name']}")
+                print("(1) Confirm  (2) Re-enter destination  (') Back to main menu")
+                c = read(min=1, max=2, digit=True, additionalValues=["'"])
+                if c == "'":
+                    event.set()
+                    return
+                if c == 1:
+                    dest_confirmed = True
+            destinations.append(dest)
+
+            print(f"\nDestinations so far: {', '.join(d['name'] for d in destinations)}")
+            print("(1) Add another destination  (2) Done adding destinations")
+            c = read(min=1, max=2, digit=True)
+            if c == 2:
+                adding_dests = False
+
+        # --- Step 3: Resource targets (per destination) ---
+        dest_configs = {}
+        for dest in destinations:
+            targets_confirmed = False
+            while not targets_confirmed:
+                print_module_banner(f"Resource Targets — {dest['name']}")
+                cap = dest.get("storageCapacity", 0)
+                fill_95 = math.floor(cap * 0.95)
+                print(f"Storage capacity: {addThousandSeparator(cap)}")
+                print(f"  f = fill to 95% ({addThousandSeparator(fill_95)})")
+                print(f"  0 or blank = skip this resource")
+                print(f"  or enter a specific amount")
+                print(f"(= restart | ' exit)\n")
+
+                targets = []
+                restart = False
+                for i, res in enumerate(materials_names):
+                    val = read(msg=f"  Target {res}: ",
+                               additionalValues=["f", "F", "=", "'", ""])
+                    if val == "'":
+                        event.set()
+                        return
+                    if val == "=":
+                        restart = True
+                        break
+                    if isinstance(val, str) and val.lower() == "f":
+                        targets.append(fill_95)
+                    elif val == "" or val == 0:
+                        targets.append(None)
+                    else:
+                        try:
+                            n = int(str(val).replace(",", ""))
+                            targets.append(n if n > 0 else None)
+                        except ValueError:
+                            targets.append(None)
+                if restart:
+                    continue
+
+                print(f"\nTargets for {dest['name']}:")
+                for i, res in enumerate(materials_names):
+                    if targets[i] is None:
+                        print(f"  {res}: skip")
+                    else:
+                        print(f"  {res}: {addThousandSeparator(targets[i])}")
+                print("(1) Confirm  (2) Re-enter  (') Back to main menu")
+                c = read(min=1, max=2, digit=True, additionalValues=["'"])
+                if c == "'":
+                    event.set()
+                    return
+                if c == 1:
+                    targets_confirmed = True
+                    dest_configs[str(dest["id"])] = targets
+
+        # --- Step 4: Source cities ---
+        src_confirmed = False
+        while not src_confirmed:
+            src_msg = ("Select source cities to send from.\n"
+                       "  (Exclude cities you don't want to use.)\n"
+                       "  After confirming, you can set reserve protection per city.")
+            source_city_ids, source_cities = rtm_ignoreCities(session, msg=src_msg)
+            if not source_city_ids:
+                print("No source cities selected!")
+                enter()
+                event.set()
+                return
+            print_module_banner("Source City Confirmation")
+            print(f"Source cities ({len(source_city_ids)}):")
+            for cid in source_city_ids:
+                print(f"  {source_cities[cid]['name']}")
+            print("\n(1) Confirm  (2) Re-select  (') Back to main menu")
+            c = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if c == "'":
+                event.set()
+                return
+            if c == 1:
+                src_confirmed = True
+
+        # --- Step 5: Reserve protection (optional, per source city) ---
+        source_reserves = {}
+        print_module_banner("Reserve Protection")
+        print("Reserve protection: Prevent source cities from being")
+        print("emptied below a threshold per resource.")
+        print("")
+        print("(1) Set up reserve protection")
+        print("(2) No reserve protection (default)")
+        reserve_choice = read(min=1, max=2, digit=True)
+        if reserve_choice == 1:
+            reserves_confirmed = False
+            while not reserves_confirmed:
+                source_reserves = {}
+                for cid in source_city_ids:
+                    cname = source_cities[cid]["name"]
+                    print_module_banner(f"Reserve — {cname}")
+                    print(f"Enter amount to keep in reserve per resource.")
+                    print(f"(0 or blank = no reserve for this resource)")
+                    print(f"(= restart this city | ' exit)\n")
+                    reserves = []
+                    restart = False
+                    for i, res in enumerate(materials_names):
+                        val = read(msg=f"  Reserve {res}: ",
+                                   min=0, digit=True,
+                                   additionalValues=["=", "'", ""])
+                        if val == "'":
+                            event.set()
+                            return
+                        if val == "=":
+                            restart = True
+                            break
+                        if val == "" or val == 0:
+                            reserves.append(0)
+                        else:
+                            reserves.append(int(str(val).replace(",", "")))
+                    if restart:
+                        continue
+                    source_reserves[cid] = reserves
+
+                print_module_banner("Reserve Protection Summary")
+                for cid in source_city_ids:
+                    cname = source_cities[cid]["name"]
+                    res_list = source_reserves.get(cid, [0] * len(materials_names))
+                    if all(r == 0 for r in res_list):
+                        print(f"  {cname}: no reserves")
+                    else:
+                        parts = []
+                        for i, res in enumerate(materials_names):
+                            if res_list[i] > 0:
+                                parts.append(f"{res} {addThousandSeparator(res_list[i])}")
+                            else:
+                                parts.append(f"{res} none")
+                        print(f"  {cname}: {' | '.join(parts)}")
+                print("\n(1) Confirm  (2) Re-enter reserves  (') Back to main menu")
+                c = read(min=1, max=2, digit=True, additionalValues=["'"])
+                if c == "'":
+                    event.set()
+                    return
+                if c == 1:
+                    reserves_confirmed = True
+
+        # --- Step 6: Check interval ---
+        interval_confirmed = False
+        while not interval_confirmed:
+            print_module_banner("Check Interval")
+            print("How often to check and top up (in hours)?")
+            print("(Recommended: 1-4 hours)")
+            print("(') Back to main menu")
+            interval_hours = read(min=1, digit=True, additionalValues=["'"])
+            if interval_hours == "'":
+                event.set()
+                return
+            print(f"\nInterval: Every {interval_hours} hour(s)")
+            print("(1) Confirm  (2) Re-enter  (') Back to main menu")
+            c = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if c == "'":
+                event.set()
+                return
+            if c == 1:
+                interval_confirmed = True
+
+        # --- Step 7: Notifications ---
+        notif_config = get_notification_config(telegram_enabled, event)
+        if notif_config is None:
+            return
+
+        # --- Step 8: Final summary + dry run ---
+        while True:
+            print_module_banner("Keep Topped Up — Summary")
+            print(f"  Ship type: {ship_label}")
+            print(f"  Destinations ({len(destinations)}):")
+            for dest in destinations:
+                parts = []
+                tgts = dest_configs[str(dest["id"])]
+                for i, res in enumerate(materials_names):
+                    if tgts[i] is None:
+                        continue
+                    parts.append(f"{res}: {addThousandSeparator(tgts[i])}")
+                print(f"    {dest['name']} — {' | '.join(parts) if parts else 'none'}")
+            src_names = ", ".join(source_cities[cid]["name"] for cid in source_city_ids)
+            print(f"  Sources ({len(source_city_ids)}): {src_names}")
+            if source_reserves:
+                print(f"  Reserve protection: enabled")
+                for cid in source_city_ids:
+                    res_list = source_reserves.get(cid, [0] * len(materials_names))
+                    if any(r > 0 for r in res_list):
+                        parts = [f"{materials_names[i]} {addThousandSeparator(res_list[i])}"
+                                 for i in range(len(materials_names)) if res_list[i] > 0]
+                        print(f"    {source_cities[cid]['name']}: {' | '.join(parts)}")
+            else:
+                print(f"  Reserve protection: none")
+            print(f"  Check interval: every {interval_hours}h")
+            print("")
+            print("(Y) Proceed  (D) Dry run preview  (N) Cancel")
+            rta = read(values=["y", "Y", "n", "N", "d", "D", ""])
+            if rta.lower() == "n":
+                event.set()
+                return
+            if rta.lower() == "d":
+                preview_routes = _top_up_dry_run(
+                    session, destinations, dest_configs,
+                    source_city_ids, source_reserves)
+                if preview_routes:
+                    run_dry_preview(preview_routes, "Keep Topped Up")
+                else:
+                    print("\n  All destinations are already at target levels.\n")
+                print("Press Enter to continue...")
+                enter()
+                continue
+            break
+
+        enter()
+
+    except KeyboardInterrupt:
+        event.set()
+        return
+
+    set_child_mode(session)
+    event.set()
+
+    dest_names = ", ".join(d["name"] for d in destinations)
+    info = (
+        f"\nKeep Topped Up: {dest_names} "
+        f"(every {interval_hours}h)\n"
+    )
+    setInfoSignal(session, info)
+    try:
+        do_it_top_up(session, destinations, dest_configs,
+                     source_city_ids, source_reserves,
+                     useFreighters, interval_hours, notif_config, log_path)
+    except Exception:
+        sendToBot(session, f"Error in:\n{info}\nCause:\n{traceback.format_exc()}")
+    finally:
+        session.logout()
+
+
+def _top_up_dry_run(session, destinations, dest_configs,
+                    source_city_ids, source_reserves):
+    preview_routes = []
+    for dest in destinations:
+        html = session.get(city_url + str(dest["id"]))
+        dest_fresh = getCity(html)
+        targets = dest_configs[str(dest["id"])]
+        needed = [0] * len(materials_names)
+        for i in range(len(materials_names)):
+            if targets[i] is None:
+                continue
+            gap = targets[i] - dest_fresh["availableResources"][i]
+            needed[i] = max(0, min(gap, dest_fresh["freeSpaceForResources"][i]))
+
+        for cid in source_city_ids:
+            if all(n <= 0 for n in needed):
+                break
+            html = session.get(city_url + cid)
+            src_fresh = getCity(html)
+            reserves = source_reserves.get(cid, [0] * len(materials_names))
+            to_send = [0] * len(materials_names)
+            for i in range(len(materials_names)):
+                if needed[i] <= 0:
+                    continue
+                avail = src_fresh["availableResources"][i]
+                reserve = reserves[i] if i < len(reserves) else 0
+                sendable = max(0, avail - reserve)
+                to_send[i] = min(needed[i], sendable)
+                needed[i] -= to_send[i]
+            if sum(to_send) > 0:
+                preview_routes.append({
+                    "source": src_fresh["name"],
+                    "dest": dest_fresh["name"],
+                    "resources": to_send,
+                })
+    return preview_routes
+
+
+# ============================================================================
+#  MODE 6 EXECUTION: do_it_top_up
+# ============================================================================
+
+def do_it_top_up(session, destinations, dest_configs, source_city_ids,
+                 source_reserves, useFreighters, interval_hours,
+                 notif_config, log_path):
+
+    total_shipments = 0
+    first_run = True
+    next_run_time = datetime.datetime.now()
+
+    while True:
+        now = datetime.datetime.now()
+        if not first_run and now < next_run_time:
+            sleep_secs = max(0, (next_run_time - now).total_seconds())
+            time.sleep(min(sleep_secs, 60))
+            continue
+
+        if should_notify(notif_config, "start"):
+            dest_names = ", ".join(d["name"] for d in destinations)
+            sendToBot(session,
+                      f"TOP-UP CYCLE STARTING\n"
+                      f"Account: {session.username}\n"
+                      f"Destinations: {dest_names}")
+
+        cycle_sent = 0
+        consecutive_failures = 0
+
+        for dest in destinations:
+            html = session.get(city_url + str(dest["id"]))
+            dest_fresh = getCity(html)
+            targets = dest_configs[str(dest["id"])]
+
+            dest_isl_id = dest_fresh["islandId"]
+            html_isl = session.get(island_url + str(dest_isl_id))
+            dest_island = getIsland(html_isl)
+            coords = f"[{dest_island['x']}:{dest_island['y']}]"
+
+            for cid in source_city_ids:
+                needed = [0] * len(materials_names)
+                for i in range(len(materials_names)):
+                    if targets[i] is None:
+                        continue
+                    gap = targets[i] - dest_fresh["availableResources"][i]
+                    needed[i] = max(0, min(gap, dest_fresh["freeSpaceForResources"][i]))
+
+                if all(n <= 0 for n in needed):
+                    break
+
+                html = session.get(city_url + cid)
+                src_fresh = getCity(html)
+                reserves = source_reserves.get(cid, [0] * len(materials_names))
+                to_send = [0] * len(materials_names)
+                for i in range(len(materials_names)):
+                    if needed[i] <= 0:
+                        continue
+                    avail = src_fresh["availableResources"][i]
+                    reserve = reserves[i] if i < len(reserves) else 0
+                    sendable = max(0, avail - reserve)
+                    to_send[i] = min(needed[i], sendable)
+
+                if sum(to_send) > 0:
+                    route = (src_fresh, dest_fresh, dest_island["id"], *to_send)
+                    result = send_shipment(
+                        session, route, useFreighters, notif_config, log_path,
+                        "TopUp", coords
+                    )
+                    if result["success"]:
+                        total_shipments += 1
+                        cycle_sent += 1
+                        consecutive_failures = 0
+                        html = session.get(city_url + str(dest["id"]))
+                        dest_fresh = getCity(html)
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3 and should_notify(notif_config, "error"):
+                            sendToBot(session,
+                                      f"WARNING: {consecutive_failures} consecutive failures")
+
+        if should_notify(notif_config, "complete"):
+            sendToBot(session,
+                      f"TOP-UP CYCLE COMPLETE\n"
+                      f"Account: {session.username}\n"
+                      f"Shipments this cycle: {cycle_sent}\n"
+                      f"Total shipments: {total_shipments}")
+
+        next_run_time = datetime.datetime.now() + datetime.timedelta(
+            hours=interval_hours
+        )
+        dest_names = ", ".join(d["name"] for d in destinations)
+        session.setStatus(
+            f"TopUp: {dest_names} | "
+            f"Sent: {total_shipments} | "
+            f"Next: {getDateTime(next_run_time.timestamp())}"
+        )
+        first_run = False
+        sleep_secs = max(0, (next_run_time - datetime.datetime.now()).total_seconds())
         time.sleep(sleep_secs)
