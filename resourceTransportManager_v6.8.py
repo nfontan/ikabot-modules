@@ -31,7 +31,7 @@ from ikabot.helpers.varios import addThousandSeparator, getDateTime
 def print_module_banner(page_title=None):
     print("\n")
     print("\u2554" + "\u2550" * 58 + "\u2557")
-    print("\u2551            RESOURCE TRANSPORT MANAGER v6.7                  \u2551")
+    print("\u2551            RESOURCE TRANSPORT MANAGER v6.8                  \u2551")
     print("\u255a" + "\u2550" * 58 + "\u255d")
     if page_title:
         print(f"\n{page_title}")
@@ -513,6 +513,36 @@ def ensure_issues_column(fieldnames, rows):
         for row in rows:
             row["Issues"] = ""
     return fieldnames
+
+
+def parse_resource_value(val):
+    """Parse a resource cell: '500' -> ('exact', 500), 'e10000' -> ('except', 10000)."""
+    val = val.strip()
+    if val.lower().startswith("e"):
+        num_part = val[1:].strip()
+        match = re.search(r"\d+", num_part)
+        return ("except", int(match.group()) if match else 0)
+    return ("exact", int(val) if val.isdigit() else 0)
+
+
+def resolve_resources(parsed, source_available, row, csv_resource_cols):
+    """Resolve parsed resource values against source city stock.
+    'except' mode: send (available - reserve), log issue if insufficient."""
+    resolved = []
+    for i, (mode, amount) in enumerate(parsed):
+        if mode == "except":
+            avail = source_available[i] if i < len(source_available) else 0
+            if avail <= amount:
+                resolved.append(0)
+                if row is not None:
+                    prev = row.get("Issues", "")
+                    note = f"{csv_resource_cols[i]}: stock {avail} <= reserve {amount}"
+                    row["Issues"] = f"{prev}; {note}" if prev else note
+            else:
+                resolved.append(avail - amount)
+        else:
+            resolved.append(amount)
+    return resolved
 
 
 def choose_run_slot(session, event, rows, run_columns):
@@ -2012,6 +2042,8 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             print("Enter the full path to your CSV file:")
         print("(Columns: X, Y, Player, City, City_Location, "
               "Wood, Wine, Marble, Crystal, Sulphur, Hours, Issues)")
+        print("(Resource values: 500 = send 500, e0 = send all, "
+              "e10000 = send all except 10k)")
         print("(') Back to main menu\n")
         csv_input = read(msg="CSV path: ", empty=True, additionalValues=["'"])
         if csv_input == "'":
@@ -2182,12 +2214,11 @@ def _scan_csv_for_preview(session, rows, run_column, source_city):
             continue
         if row.get("Issues", "").strip():
             continue
-        resources = []
-        for col in csv_res_cols:
-            val = row.get(col, "0").strip()
-            resources.append(int(val) if val.isdigit() else 0)
-        if sum(resources) == 0:
+        parsed = [parse_resource_value(row.get(col, "0")) for col in csv_res_cols]
+        has_resources = any(amt > 0 or mode == "except" for mode, amt in parsed)
+        if not has_resources:
             continue
+        resources = [amt for _, amt in parsed]
         city_name = row.get("City", "?")
         player = row.get("Player", "?")
         preview.append({
@@ -2260,11 +2291,9 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 expected_city = row["City"].strip()
                 expected_location = str(row.get("City_Location", "")).strip()
 
-                resources = []
-                for col in csv_resource_cols:
-                    val = row.get(col, "0").strip()
-                    resources.append(int(val) if val.isdigit() else 0)
-                if sum(resources) == 0:
+                parsed_resources = [parse_resource_value(row.get(col, "0")) for col in csv_resource_cols]
+                has_resources = any(amt > 0 or mode == "except" for mode, amt in parsed_resources)
+                if not has_resources:
                     continue
 
                 html = session.get(
@@ -2337,6 +2366,15 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
             f"Building {len(validated_cities)} route(s)..."
         )
 
+        has_except_rows = any(
+            any(parse_resource_value(rows[rn - 1].get(col, "0"))[0] == "except"
+                for col in csv_resource_cols)
+            for rn in validated_cities
+        )
+        if has_except_rows:
+            source_html = session.get(city_url + str(source_city["id"]))
+            source_city = getCity(source_html)
+
         for row_num, row in enumerate(rows, start=1):
             if normalize_text(row.get(run_column, "")) == "x":
                 continue
@@ -2344,10 +2382,11 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 continue
 
             matched_city, island = validated_cities[row_num]
-            resources = []
-            for col in csv_resource_cols:
-                val = row.get(col, "0").strip()
-                resources.append(int(val) if val.isdigit() else 0)
+            parsed_resources = [parse_resource_value(row.get(col, "0")) for col in csv_resource_cols]
+            resources = resolve_resources(
+                parsed_resources, source_city.get("availableResources", []),
+                row, csv_resource_cols
+            )
             if sum(resources) == 0:
                 continue
 
@@ -2414,6 +2453,14 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                         write_csv_atomic(csv_path, fieldnames, rows)
                     except Exception as we:
                         print(f"    WARNING: checkpoint write failed: {we}")
+                    # Re-fetch source city if upcoming routes use "except"
+                    if any(
+                        any(parse_resource_value(rows[r[0] - 1].get(col, "0"))[0] == "except"
+                            for col in csv_resource_cols)
+                        for r in routes[idx + 1:]
+                    ):
+                        source_html = session.get(city_url + str(source_city["id"]))
+                        source_city = getCity(source_html)
                 else:
                     print(f"    FAILED: {result['error']}")
 
