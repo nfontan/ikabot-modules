@@ -7,6 +7,7 @@ import datetime
 import json
 import math
 import os
+import random
 import re
 import csv
 import tempfile
@@ -30,7 +31,7 @@ from ikabot.helpers.varios import addThousandSeparator, getDateTime
 def print_module_banner(page_title=None):
     print("\n")
     print("\u2554" + "\u2550" * 58 + "\u2557")
-    print("\u2551            RESOURCE TRANSPORT MANAGER v6.5                  \u2551")
+    print("\u2551            RESOURCE TRANSPORT MANAGER v7.0                  \u2551")
     print("\u255a" + "\u2550" * 58 + "\u255d")
     if page_title:
         print(f"\n{page_title}")
@@ -291,7 +292,7 @@ def wait_for_ships(session, useFreighters, status_prefix="", max_wait=3600):
         session.setStatus(
             f"{status_prefix}Waiting for {ship_type}... ({elapsed}s)"
         )
-        time.sleep(120)
+        time.sleep(20 + random.randint(-5, 5))
 
 
 # ============================================================================
@@ -495,6 +496,124 @@ def get_city_location_token(city_data):
         if key in city_data and str(city_data.get(key, "")).strip() != "":
             return str(city_data.get(key)).strip()
     return None
+
+
+def ensure_transport_column(fieldnames, rows):
+    """Add Transport column at position 0 if missing (backward compatibility)."""
+    if "Transport" not in fieldnames:
+        fieldnames.insert(0, "Transport")
+        for row in rows:
+            row["Transport"] = "m"
+    return fieldnames
+
+
+def parse_transport_value(val):
+    """Parse Transport column: 'f' -> True (freighters), else False (merchant)."""
+    return val.strip().lower() == "f"
+
+
+def ensure_from_column(fieldnames, rows):
+    """Add From column after Sulphur if missing (backward compatibility)."""
+    if "From" not in fieldnames:
+        insert_idx = len(fieldnames)
+        if "Sulphur" in fieldnames:
+            insert_idx = fieldnames.index("Sulphur") + 1
+        else:
+            for i, col in enumerate(fieldnames):
+                if col in ("Hours", "Issues") or col.startswith("Run_"):
+                    insert_idx = i
+                    break
+        fieldnames.insert(insert_idx, "From")
+        for row in rows:
+            row["From"] = ""
+    return fieldnames
+
+
+def parse_from_column(val):
+    """Parse From column: '' -> None, 'a' -> 'all', '1,3,5' -> [1,3,5]."""
+    val = val.strip()
+    if not val:
+        return None
+    if val.lower() == "a":
+        return "all"
+    indices = []
+    for part in val.split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) >= 1:
+            indices.append(int(part))
+    return indices if indices else None
+
+
+def get_source_cities_for_row(session, from_val, city_cache):
+    """Return list of (city_index, city_obj) for a row's From value.
+    city_cache is a dict with keys 'ids' and 'objects' to avoid redundant fetches."""
+    if "ids" not in city_cache:
+        ids, cities_map = getIdsOfCities(session)
+        city_cache["ids"] = ids
+        city_cache["map"] = cities_map
+
+    ids = city_cache["ids"]
+
+    if from_val == "all":
+        target_indices = list(range(1, len(ids) + 1))
+    else:
+        target_indices = [i for i in from_val if 1 <= i <= len(ids)]
+
+    result = []
+    for idx in target_indices:
+        city_id = ids[idx - 1]
+        if city_id not in city_cache.get("objects", {}):
+            html = session.get(city_url + city_id)
+            city_cache.setdefault("objects", {})[city_id] = getCity(html)
+        result.append((idx, city_cache["objects"][city_id]))
+    return result
+
+
+def ensure_issues_column(fieldnames, rows):
+    """Add Issues column if missing (backward compatibility). Returns updated fieldnames."""
+    if "Issues" not in fieldnames:
+        insert_idx = len(fieldnames)
+        if "Hours" in fieldnames:
+            insert_idx = fieldnames.index("Hours") + 1
+        else:
+            for i, col in enumerate(fieldnames):
+                if col.startswith("Run_"):
+                    insert_idx = i
+                    break
+        fieldnames.insert(insert_idx, "Issues")
+        for row in rows:
+            row["Issues"] = ""
+    return fieldnames
+
+
+def parse_resource_value(val):
+    """Parse a resource cell: '500' -> ('exact', 500), 'e10000' -> ('except', 10000)."""
+    val = val.strip()
+    if val.lower().startswith("e"):
+        num_part = val[1:].strip()
+        match = re.search(r"\d+", num_part)
+        return ("except", int(match.group()) if match else 0)
+    return ("exact", int(val) if val.isdigit() else 0)
+
+
+def resolve_resources(parsed, source_available, row, csv_resource_cols):
+    """Resolve parsed resource values against source city stock.
+    'except' mode: send (available - reserve), log issue if insufficient."""
+    resolved = []
+    for i, (mode, amount) in enumerate(parsed):
+        if mode == "except":
+            avail = source_available[i] if i < len(source_available) else 0
+            if avail <= amount:
+                resolved.append(0)
+                if row is not None:
+                    prev = row.get("Issues", "")
+                    note = f"{csv_resource_cols[i]}: stock {avail} <= reserve {amount}"
+                    row["Issues"] = f"{prev}; {note}" if prev else note
+            else:
+                resolved.append(avail - amount)
+        else:
+            resolved.append(amount)
+    return resolved
 
 
 def choose_run_slot(session, event, rows, run_columns):
@@ -763,8 +882,9 @@ def resourceTransportManager(session, event, stdin_fd, predetermined_input):
         print("(3) Even Distribution: Balance resources across cities")
         print("(4) Auto Send: Request resources, auto-collect from all")
         print("(5) Mass Distribution: Send from CSV file")
+        print("(6) Keep Topped Up: Automatically top up a city's resources")
         print("(') Back to main menu")
-        shipping_mode = read(min=1, max=5, digit=True, additionalValues=["'"])
+        shipping_mode = read(min=1, max=6, digit=True, additionalValues=["'"])
         if shipping_mode == "'":
             event.set()
             return
@@ -782,10 +902,14 @@ def resourceTransportManager(session, event, stdin_fd, predetermined_input):
         elif shipping_mode == 4:
             autoSendMode(session, event, stdin_fd, predetermined_input,
                          telegram_enabled, log_path)
-        else:
+        elif shipping_mode == 5:
             massDistributionMode(session, event, stdin_fd,
                                  predetermined_input, telegram_enabled,
                                  log_path)
+        else:
+            topUpMode(session, event, stdin_fd,
+                      predetermined_input, telegram_enabled,
+                      log_path)
 
     except KeyboardInterrupt:
         event.set()
@@ -1992,8 +2116,12 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             print(f"CSV file (Enter to reuse last: {saved_csv}):")
         else:
             print("Enter the full path to your CSV file:")
-        print("(Columns: X, Y, Player, City, City_Location, "
-              "Wood, Wine, Marble, Crystal, Sulphur, Hours)")
+        print("(Columns: Transport, X, Y, Player, City, City_Location, "
+              "Wood, Wine, Marble, Crystal, Sulphur, From, Hours, Issues)")
+        print("(Transport: m = merchant ships, f = freighters)")
+        print("(Resource values: 500 = send 500, e0 = send all, "
+              "e10000 = send all except 10k)")
+        print("(From: a = all cities, 1,3,5 = specific cities)")
         print("(') Back to main menu\n")
         csv_input = read(msg="CSV path: ", empty=True, additionalValues=["'"])
         if csv_input == "'":
@@ -2044,13 +2172,14 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             event.set()
             return
 
-        try:
-            interval_hours = int(str(rows[0].get("Hours", "")).strip())
-        except Exception:
-            print("Invalid Hours value in CSV row 1.")
+        hours_raw = str(rows[0].get("Hours", "")).strip()
+        hours_match = re.search(r"\d+", hours_raw)
+        if not hours_match:
+            print("Invalid Hours value in CSV row 1 (no number found).")
             enter()
             event.set()
             return
+        interval_hours = int(hours_match.group())
 
         if interval_hours <= 0:
             print("Hours must be >= 1 for Mass Distribution.")
@@ -2059,6 +2188,9 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             return
 
         fieldnames, run_columns = ensure_run_columns(fieldnames, rows)
+        fieldnames = ensure_transport_column(fieldnames, rows)
+        fieldnames = ensure_from_column(fieldnames, rows)
+        fieldnames = ensure_issues_column(fieldnames, rows)
 
         mode, run_column = choose_run_slot(session, event, rows, run_columns)
         if run_column is None:
@@ -2076,24 +2208,6 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
             event.set()
             return
 
-        print_module_banner("Mass Distribution")
-        print(f"CSV loaded: {len(rows)} rows")
-        print(f"Interval: every {interval_hours} hour(s)")
-        print(f"Run slot: {run_column[4:]}\n")
-        print("What type of ships do you want to use?")
-        print("(1) Merchant ships")
-        print("(2) Freighters")
-        print("(') Back to main menu")
-        shiptype = read(min=1, max=2, digit=True, additionalValues=["'"])
-        if shiptype == "'":
-            event.set()
-            return
-        useFreighters = (shiptype == 2)
-
-        print_module_banner("Mass Distribution")
-        print("Select the source city:\n")
-        source_city = rtm_chooseCity(session)
-
         # Notifications
         notif_config = get_notification_config(telegram_enabled, event)
         if notif_config is None:
@@ -2102,9 +2216,6 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
         # Final confirmation with dry run
         while True:
             print_module_banner("Mass Distribution - Summary")
-            print(f"  Source: {source_city['name']}")
-            ship_label = "Freighters" if useFreighters else "Merchant ships"
-            print(f"  Ships: {ship_label}")
             print(f"  CSV rows: {len(rows)}")
             print(f"  Interval: every {interval_hours}h")
             print(f"  Run slot: {run_column[4:]}\n")
@@ -2115,10 +2226,7 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
                 event.set()
                 return
             if rta.lower() == "d":
-                # Quick scan CSV for preview
-                preview = _scan_csv_for_preview(
-                    session, rows, run_column, source_city
-                )
+                preview = _scan_csv_for_preview(session, rows, run_column)
                 if preview:
                     run_dry_preview(preview, "Mass Distribution")
                 else:
@@ -2137,15 +2245,11 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
     set_child_mode(session)
     event.set()
 
-    info = (
-        f"\nMass Distribution from {source_city['name']} "
-        f"every {interval_hours}h\n"
-    )
+    info = f"\nMass Distribution every {interval_hours}h\n"
     setInfoSignal(session, info)
 
     try:
-        do_it_mass_distribution(session, csv_path, source_city,
-                                useFreighters, interval_hours,
+        do_it_mass_distribution(session, csv_path, interval_hours,
                                 notif_config, run_column, log_path)
     except Exception:
         sendToBot(session, f"Error:\n{info}\n{traceback.format_exc()}")
@@ -2153,23 +2257,32 @@ def massDistributionMode(session, event, stdin_fd, predetermined_input,
         session.logout()
 
 
-def _scan_csv_for_preview(session, rows, run_column, source_city):
+def _scan_csv_for_preview(session, rows, run_column):
     """Quick scan for dry-run preview. Returns list of route info dicts."""
     csv_res_cols = ["Wood", "Wine", "Marble", "Crystal", "Sulphur"]
     preview = []
     for row in rows:
         if normalize_text(row.get(run_column, "")) == "x":
             continue
-        resources = []
-        for col in csv_res_cols:
-            val = row.get(col, "0").strip()
-            resources.append(int(val) if val.isdigit() else 0)
-        if sum(resources) == 0:
+        if row.get("Issues", "").strip():
             continue
+        parsed = [parse_resource_value(row.get(col, "0")) for col in csv_res_cols]
+        has_resources = any(amt > 0 or mode == "except" for mode, amt in parsed)
+        if not has_resources:
+            continue
+        resources = [amt for _, amt in parsed]
         city_name = row.get("City", "?")
         player = row.get("Player", "?")
+        from_val = parse_from_column(row.get("From", ""))
+        if from_val is None:
+            src_label = "From: (not set)"
+        elif from_val == "all":
+            src_label = "All cities"
+        else:
+            src_label = f"Cities {','.join(str(i) for i in from_val)}"
+        transport = "Freighters" if parse_transport_value(row.get("Transport", "m")) else "Merchant"
         preview.append({
-            "source": source_city["name"],
+            "source": f"{src_label} ({transport})",
             "dest": f"{city_name} ({player})",
             "resources": resources,
         })
@@ -2180,10 +2293,8 @@ def _scan_csv_for_preview(session, rows, run_column, source_city):
 #  MODE 5 EXECUTION: do_it_mass_distribution
 # ============================================================================
 
-def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
-                            interval_hours, notif_config, run_column,
-                            log_path):
-    ship_type_name = "freighters" if useFreighters else "merchant ships"
+def do_it_mass_distribution(session, csv_path, interval_hours,
+                            notif_config, run_column, log_path):
     csv_resource_cols = ["Wood", "Wine", "Marble", "Crystal", "Sulphur"]
 
     while True:
@@ -2213,24 +2324,58 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 time.sleep(3600)
                 continue
 
+        # Ensure Transport, From and Issues columns exist; clear Issues for this cycle
+        fieldnames = ensure_transport_column(fieldnames, rows)
+        fieldnames = ensure_from_column(fieldnames, rows)
+        fieldnames = ensure_issues_column(fieldnames, rows)
+        for row in rows:
+            row["Issues"] = ""
+
+        city_cache = {}
         mismatches = []
-        routes = []
+        validated_cities = {}
 
         session.setStatus(
-            f"[PROCESSING] Mass Distribution | "
-            f"Scanning {len(rows)} rows..."
+            f"[PRE-SCAN] Mass Distribution | "
+            f"Validating {len(rows)} rows..."
         )
 
+        # ---- PHASE 1: Pre-scan validation ----
         for row_num, row in enumerate(rows, start=1):
             try:
-                if normalize_text(row.get(run_column, "")) == "x":
+                run_val = normalize_text(row.get(run_column, ""))
+                if run_val == "x":
                     continue
 
                 x = row["X"].strip()
                 y = row["Y"].strip()
                 expected_player = row["Player"].strip()
                 expected_city = row["City"].strip()
-                expected_location = str(row["City_Location"].strip())
+                expected_location = str(row.get("City_Location", "")).strip()
+
+                parsed_resources = [parse_resource_value(row.get(col, "0")) for col in csv_resource_cols]
+                has_resources = any(amt > 0 or mode == "except" for mode, amt in parsed_resources)
+                if not has_resources:
+                    continue
+
+                from_val = parse_from_column(row.get("From", ""))
+                if from_val is None:
+                    issue = "From column is empty (required: a, or city indices like 1,3,5)"
+                    row["Issues"] = issue
+                    mismatches.append(f"Row {row_num}: {issue}")
+                    continue
+                if isinstance(from_val, list):
+                    if "ids" not in city_cache:
+                        ids_tmp, map_tmp = getIdsOfCities(session)
+                        city_cache["ids"] = ids_tmp
+                        city_cache["map"] = map_tmp
+                    max_idx = len(city_cache["ids"])
+                    bad = [str(i) for i in from_val if i > max_idx]
+                    if bad:
+                        issue = f"From: city index {','.join(bad)} out of range (max {max_idx})"
+                        row["Issues"] = issue
+                        mismatches.append(f"Row {row_num}: {issue}")
+                        continue
 
                 html = session.get(
                     f"view=island&xcoord={x}&ycoord={y}"
@@ -2265,38 +2410,102 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                         matched_city = candidates[0]
 
                 if matched_city is None:
-                    mismatches.append(
-                        f"Row {row_num}: [{x}:{y}] "
-                        f"{expected_player}/{expected_city}"
-                    )
+                    issue = (f"City not found: {expected_player}/"
+                             f"{expected_city} at [{x}:{y}]")
+                    row["Issues"] = issue
+                    mismatches.append(f"Row {row_num}: {issue}")
                     continue
 
-                resources = []
-                for col in csv_resource_cols:
-                    val = row.get(col, "0").strip()
-                    resources.append(int(val) if val.isdigit() else 0)
+                # Auto-fill City_Location if empty
+                if not expected_location:
+                    loc_token = get_city_location_token(matched_city)
+                    if loc_token:
+                        row["City_Location"] = loc_token
 
-                if sum(resources) == 0:
-                    continue
-
-                dest_html = session.get(city_url + str(matched_city["id"]))
-                dest_city = getCity(dest_html)
-
-                route = (source_city, dest_city, island["id"], *resources)
-                routes.append((
-                    row_num, route, resources, dest_city["name"],
-                    expected_player, x, y
-                ))
+                validated_cities[row_num] = (matched_city, island)
 
             except Exception as e:
-                mismatches.append(
-                    f"Row {row_num}: Error: {e}"
-                )
+                issue = f"Error: {e}"
+                row["Issues"] = issue
+                mismatches.append(f"Row {row_num}: {issue}")
+
+        # Save CSV after pre-scan (persists Issues + City_Location auto-fills)
+        try:
+            write_csv_atomic(csv_path, fieldnames, rows)
+        except Exception as we:
+            print(f"    WARNING: pre-scan CSV write failed: {we}")
 
         if mismatches and should_notify(notif_config, "error"):
             sendToBot(session,
-                      f"MASS DIST MISMATCHES\n"
+                      f"MASS DIST ISSUES\n"
                       + "\n".join(mismatches))
+
+        # ---- PHASE 2: Build routes from validated rows ----
+        routes = []
+        session.setStatus(
+            f"[PROCESSING] Mass Distribution | "
+            f"Building routes for {len(validated_cities)} row(s)..."
+        )
+
+        # Refresh city cache for "except" resolution
+        city_cache.pop("objects", None)
+
+        for row_num, row in enumerate(rows, start=1):
+            run_val = normalize_text(row.get(run_column, ""))
+            if run_val == "x":
+                continue
+            if row_num not in validated_cities:
+                continue
+
+            matched_city, island = validated_cities[row_num]
+            x = row["X"].strip()
+            y = row["Y"].strip()
+            expected_player = row["Player"].strip()
+            parsed_resources = [parse_resource_value(row.get(col, "0")) for col in csv_resource_cols]
+
+            from_val = parse_from_column(row.get("From", ""))
+            row_use_freighters = parse_transport_value(row.get("Transport", "m"))
+            try:
+                src_cities = get_source_cities_for_row(
+                    session, from_val, city_cache
+                )
+            except Exception as e:
+                row["Issues"] = f"Error resolving source cities: {e}"
+                continue
+
+            done_indices = set()
+            if run_val and run_val != "x":
+                for p in run_val.split(","):
+                    p = p.strip()
+                    if p.isdigit():
+                        done_indices.add(int(p))
+
+            try:
+                dest_html = session.get(city_url + str(matched_city["id"]))
+                dest_city = getCity(dest_html)
+            except Exception as e:
+                row["Issues"] = f"Error fetching city details: {e}"
+                try:
+                    write_csv_atomic(csv_path, fieldnames, rows)
+                except Exception:
+                    pass
+                continue
+
+            for src_idx, src_city in src_cities:
+                if src_idx in done_indices:
+                    continue
+                resources = resolve_resources(
+                    parsed_resources, src_city.get("availableResources", []),
+                    row, csv_resource_cols
+                )
+                if sum(resources) == 0:
+                    continue
+                route = (src_city, dest_city, island["id"], *resources)
+                routes.append((
+                    row_num, route, resources, dest_city["name"],
+                    expected_player, x, y, src_city["name"], src_idx,
+                    row_use_freighters
+                ))
 
         if not routes:
             if should_notify(notif_config, "error"):
@@ -2305,43 +2514,76 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
             if should_notify(notif_config, "start"):
                 sendToBot(session,
                           f"MASS DIST SCHEDULED\n"
-                          f"Source: {source_city['name']}\n"
                           f"{len(routes)} shipment(s)")
 
             completed = 0
             total = len(routes)
 
             for idx, (row_num, route, resources, dest_name,
-                      player, rx, ry) in enumerate(routes):
+                      player, rx, ry, src_name, src_idx,
+                      row_freighters) in enumerate(routes):
+                ship_label = "F" if row_freighters else "M"
                 res_desc = ", ".join(
                     f"{addThousandSeparator(resources[i])} "
                     f"{materials_names[i]}"
                     for i in range(len(materials_names))
                     if resources[i] > 0
                 )
-                print(f"\n  [{idx+1}/{total}] {source_city['name']} -> "
+                print(f"\n  [{idx+1}/{total}] [{ship_label}] {src_name} -> "
                       f"{dest_name} ({player}) [{rx}:{ry}]")
 
                 session.setStatus(
                     f"[SENDING] Mass Dist [{idx+1}/{total}] "
-                    f"-> {dest_name}"
+                    f"{src_name} -> {dest_name}"
                 )
 
                 coords = f"[{rx}:{ry}]"
                 result = send_shipment(
-                    session, route, useFreighters, notif_config,
+                    session, route, row_freighters, notif_config,
                     log_path, "Mass Distribution", coords, player
                 )
 
                 if result["success"]:
                     completed += 1
                     print(f"    SUCCESS ({completed}/{total})")
-                    # Checkpoint
-                    rows[row_num - 1][run_column] = "X"
+                    # Per-city checkpoint
+                    from_val = parse_from_column(rows[row_num - 1].get("From", ""))
+                    cur = rows[row_num - 1].get(run_column, "").strip()
+                    done = set()
+                    if cur and cur.upper() != "X":
+                        for p in cur.split(","):
+                            p = p.strip()
+                            if p.isdigit():
+                                done.add(int(p))
+                    done.add(src_idx)
+                    try:
+                        expected = get_source_cities_for_row(
+                            session, from_val, city_cache
+                        )
+                        expected_indices = {i for i, _ in expected}
+                    except Exception:
+                        expected_indices = done
+                    if done >= expected_indices:
+                        rows[row_num - 1][run_column] = "X"
+                    else:
+                        rows[row_num - 1][run_column] = ",".join(
+                            str(d) for d in sorted(done)
+                        )
                     try:
                         write_csv_atomic(csv_path, fieldnames, rows)
                     except Exception as we:
                         print(f"    WARNING: checkpoint write failed: {we}")
+                    # Re-fetch sent source city if upcoming routes use "except"
+                    sent_city_id = route[0]["id"]
+                    if any(
+                        any(parse_resource_value(rows[r[0] - 1].get(col, "0"))[0] == "except"
+                            for col in csv_resource_cols)
+                        for r in routes[idx + 1:]
+                        if str(r[1][0]["id"]) == str(sent_city_id)
+                    ):
+                        city_cache.get("objects", {})[str(sent_city_id)] = getCity(
+                            session.get(city_url + str(sent_city_id))
+                        )
                 else:
                     print(f"    FAILED: {result['error']}")
 
@@ -2353,7 +2595,6 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
                 )
                 sendToBot(session,
                           f"MASS DIST COMPLETE\n"
-                          f"Source: {source_city['name']}\n"
                           f"Slot: {run_column[4:]}\n"
                           f"Cycle: {completed}/{total}\n"
                           f"Progress: {run_done}/{len(rows)}")
@@ -2369,4 +2610,438 @@ def do_it_mass_distribution(session, csv_path, source_city, useFreighters,
         sleep_secs = max(
             0, (next_run - datetime.datetime.now()).total_seconds()
         )
+        time.sleep(sleep_secs)
+
+
+# ============================================================================
+#  MODE 6: KEEP TOPPED UP  (periodically fill destinations from sources)
+# ============================================================================
+
+def topUpMode(session, event, stdin_fd, predetermined_input,
+              telegram_enabled, log_path):
+    try:
+        # --- Step 1: Ship type ---
+        ship_confirmed = False
+        while not ship_confirmed:
+            print_module_banner("Ship Type Selection")
+            print("What type of ships do you want to use?")
+            print("(1) Merchant ships")
+            print("(2) Freighters")
+            print("(') Back to main menu")
+            shiptype = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if shiptype == "'":
+                event.set()
+                return
+            useFreighters = (shiptype == 2)
+            ship_label = "Freighters" if useFreighters else "Merchant ships"
+            print(f"\nShip type: {ship_label}")
+            print("(1) Confirm  (2) Re-enter  (') Back to main menu")
+            c = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if c == "'":
+                event.set()
+                return
+            if c == 1:
+                ship_confirmed = True
+
+        # --- Step 2: Destination cities (multi-destination loop) ---
+        destinations = []
+        adding_dests = True
+        while adding_dests:
+            dest_confirmed = False
+            while not dest_confirmed:
+                print_module_banner("Destination Selection")
+                if destinations:
+                    print("Current destinations: " +
+                          ", ".join(d["name"] for d in destinations))
+                    print("")
+                print("Select destination city:")
+                dest = rtm_chooseCity(session)
+                if dest is None:
+                    event.set()
+                    return
+                print(f"\nSelected: {dest['name']}")
+                print("(1) Confirm  (2) Re-enter destination  (') Back to main menu")
+                c = read(min=1, max=2, digit=True, additionalValues=["'"])
+                if c == "'":
+                    event.set()
+                    return
+                if c == 1:
+                    dest_confirmed = True
+            destinations.append(dest)
+
+            print(f"\nDestinations so far: {', '.join(d['name'] for d in destinations)}")
+            print("(1) Add another destination  (2) Done adding destinations")
+            c = read(min=1, max=2, digit=True)
+            if c == 2:
+                adding_dests = False
+
+        # --- Step 3: Resource targets (per destination) ---
+        dest_configs = {}
+        for dest in destinations:
+            targets_confirmed = False
+            while not targets_confirmed:
+                print_module_banner(f"Resource Targets — {dest['name']}")
+                cap = dest.get("storageCapacity", 0)
+                fill_95 = math.floor(cap * 0.95)
+                print(f"Storage capacity: {addThousandSeparator(cap)}")
+                print(f"  f = fill to 95% ({addThousandSeparator(fill_95)})")
+                print(f"  0 or blank = skip this resource")
+                print(f"  or enter a specific amount")
+                print(f"(= restart | ' exit)\n")
+
+                targets = []
+                restart = False
+                for i, res in enumerate(materials_names):
+                    val = read(msg=f"  Target {res}: ",
+                               additionalValues=["f", "F", "=", "'", ""])
+                    if val == "'":
+                        event.set()
+                        return
+                    if val == "=":
+                        restart = True
+                        break
+                    if isinstance(val, str) and val.lower() == "f":
+                        targets.append(fill_95)
+                    elif val == "" or val == 0:
+                        targets.append(None)
+                    else:
+                        try:
+                            n = int(str(val).replace(",", ""))
+                            targets.append(n if n > 0 else None)
+                        except ValueError:
+                            targets.append(None)
+                if restart:
+                    continue
+
+                print(f"\nTargets for {dest['name']}:")
+                for i, res in enumerate(materials_names):
+                    if targets[i] is None:
+                        print(f"  {res}: skip")
+                    else:
+                        print(f"  {res}: {addThousandSeparator(targets[i])}")
+                print("(1) Confirm  (2) Re-enter  (') Back to main menu")
+                c = read(min=1, max=2, digit=True, additionalValues=["'"])
+                if c == "'":
+                    event.set()
+                    return
+                if c == 1:
+                    targets_confirmed = True
+                    dest_configs[str(dest["id"])] = targets
+
+        # --- Step 4: Source cities ---
+        src_confirmed = False
+        while not src_confirmed:
+            src_msg = ("Select source cities to send from.\n"
+                       "  (Exclude cities you don't want to use.)\n"
+                       "  After confirming, you can set reserve protection per city.")
+            source_city_ids, source_cities = rtm_ignoreCities(session, msg=src_msg)
+            if not source_city_ids:
+                print("No source cities selected!")
+                enter()
+                event.set()
+                return
+            print_module_banner("Source City Confirmation")
+            print(f"Source cities ({len(source_city_ids)}):")
+            for cid in source_city_ids:
+                print(f"  {source_cities[cid]['name']}")
+            print("\n(1) Confirm  (2) Re-select  (') Back to main menu")
+            c = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if c == "'":
+                event.set()
+                return
+            if c == 1:
+                src_confirmed = True
+
+        # --- Step 5: Reserve protection (optional, per source city) ---
+        source_reserves = {}
+        print_module_banner("Reserve Protection")
+        print("Reserve protection: Prevent source cities from being")
+        print("emptied below a threshold per resource.")
+        print("")
+        print("(1) Set up reserve protection")
+        print("(2) No reserve protection (default)")
+        reserve_choice = read(min=1, max=2, digit=True)
+        if reserve_choice == 1:
+            reserves_confirmed = False
+            while not reserves_confirmed:
+                source_reserves = {}
+                for cid in source_city_ids:
+                    cname = source_cities[cid]["name"]
+                    print_module_banner(f"Reserve — {cname}")
+                    print(f"Enter amount to keep in reserve per resource.")
+                    print(f"(0 or blank = no reserve for this resource)")
+                    print(f"(= restart this city | ' exit)\n")
+                    reserves = []
+                    restart = False
+                    for i, res in enumerate(materials_names):
+                        val = read(msg=f"  Reserve {res}: ",
+                                   min=0, digit=True,
+                                   additionalValues=["=", "'", ""])
+                        if val == "'":
+                            event.set()
+                            return
+                        if val == "=":
+                            restart = True
+                            break
+                        if val == "" or val == 0:
+                            reserves.append(0)
+                        else:
+                            reserves.append(int(str(val).replace(",", "")))
+                    if restart:
+                        continue
+                    source_reserves[cid] = reserves
+
+                print_module_banner("Reserve Protection Summary")
+                for cid in source_city_ids:
+                    cname = source_cities[cid]["name"]
+                    res_list = source_reserves.get(cid, [0] * len(materials_names))
+                    if all(r == 0 for r in res_list):
+                        print(f"  {cname}: no reserves")
+                    else:
+                        parts = []
+                        for i, res in enumerate(materials_names):
+                            if res_list[i] > 0:
+                                parts.append(f"{res} {addThousandSeparator(res_list[i])}")
+                            else:
+                                parts.append(f"{res} none")
+                        print(f"  {cname}: {' | '.join(parts)}")
+                print("\n(1) Confirm  (2) Re-enter reserves  (') Back to main menu")
+                c = read(min=1, max=2, digit=True, additionalValues=["'"])
+                if c == "'":
+                    event.set()
+                    return
+                if c == 1:
+                    reserves_confirmed = True
+
+        # --- Step 6: Check interval ---
+        interval_confirmed = False
+        while not interval_confirmed:
+            print_module_banner("Check Interval")
+            print("How often to check and top up (in hours)?")
+            print("(Recommended: 1-4 hours)")
+            print("(') Back to main menu")
+            interval_hours = read(min=1, digit=True, additionalValues=["'"])
+            if interval_hours == "'":
+                event.set()
+                return
+            print(f"\nInterval: Every {interval_hours} hour(s)")
+            print("(1) Confirm  (2) Re-enter  (') Back to main menu")
+            c = read(min=1, max=2, digit=True, additionalValues=["'"])
+            if c == "'":
+                event.set()
+                return
+            if c == 1:
+                interval_confirmed = True
+
+        # --- Step 7: Notifications ---
+        notif_config = get_notification_config(telegram_enabled, event)
+        if notif_config is None:
+            return
+
+        # --- Step 8: Final summary + dry run ---
+        while True:
+            print_module_banner("Keep Topped Up — Summary")
+            print(f"  Ship type: {ship_label}")
+            print(f"  Destinations ({len(destinations)}):")
+            for dest in destinations:
+                parts = []
+                tgts = dest_configs[str(dest["id"])]
+                for i, res in enumerate(materials_names):
+                    if tgts[i] is None:
+                        continue
+                    parts.append(f"{res}: {addThousandSeparator(tgts[i])}")
+                print(f"    {dest['name']} — {' | '.join(parts) if parts else 'none'}")
+            src_names = ", ".join(source_cities[cid]["name"] for cid in source_city_ids)
+            print(f"  Sources ({len(source_city_ids)}): {src_names}")
+            if source_reserves:
+                print(f"  Reserve protection: enabled")
+                for cid in source_city_ids:
+                    res_list = source_reserves.get(cid, [0] * len(materials_names))
+                    if any(r > 0 for r in res_list):
+                        parts = [f"{materials_names[i]} {addThousandSeparator(res_list[i])}"
+                                 for i in range(len(materials_names)) if res_list[i] > 0]
+                        print(f"    {source_cities[cid]['name']}: {' | '.join(parts)}")
+            else:
+                print(f"  Reserve protection: none")
+            print(f"  Check interval: every {interval_hours}h")
+            print("")
+            print("(Y) Proceed  (D) Dry run preview  (N) Cancel")
+            rta = read(values=["y", "Y", "n", "N", "d", "D", ""])
+            if rta.lower() == "n":
+                event.set()
+                return
+            if rta.lower() == "d":
+                preview_routes = _top_up_dry_run(
+                    session, destinations, dest_configs,
+                    source_city_ids, source_reserves)
+                if preview_routes:
+                    run_dry_preview(preview_routes, "Keep Topped Up")
+                else:
+                    print("\n  All destinations are already at target levels.\n")
+                print("Press Enter to continue...")
+                enter()
+                continue
+            break
+
+        enter()
+
+    except KeyboardInterrupt:
+        event.set()
+        return
+
+    set_child_mode(session)
+    event.set()
+
+    dest_names = ", ".join(d["name"] for d in destinations)
+    info = (
+        f"\nKeep Topped Up: {dest_names} "
+        f"(every {interval_hours}h)\n"
+    )
+    setInfoSignal(session, info)
+    try:
+        do_it_top_up(session, destinations, dest_configs,
+                     source_city_ids, source_reserves,
+                     useFreighters, interval_hours, notif_config, log_path)
+    except Exception:
+        sendToBot(session, f"Error in:\n{info}\nCause:\n{traceback.format_exc()}")
+    finally:
+        session.logout()
+
+
+def _top_up_dry_run(session, destinations, dest_configs,
+                    source_city_ids, source_reserves):
+    preview_routes = []
+    for dest in destinations:
+        html = session.get(city_url + str(dest["id"]))
+        dest_fresh = getCity(html)
+        targets = dest_configs[str(dest["id"])]
+        needed = [0] * len(materials_names)
+        for i in range(len(materials_names)):
+            if targets[i] is None:
+                continue
+            gap = targets[i] - dest_fresh["availableResources"][i]
+            needed[i] = max(0, min(gap, dest_fresh["freeSpaceForResources"][i]))
+
+        for cid in source_city_ids:
+            if all(n <= 0 for n in needed):
+                break
+            html = session.get(city_url + cid)
+            src_fresh = getCity(html)
+            reserves = source_reserves.get(cid, [0] * len(materials_names))
+            to_send = [0] * len(materials_names)
+            for i in range(len(materials_names)):
+                if needed[i] <= 0:
+                    continue
+                avail = src_fresh["availableResources"][i]
+                reserve = reserves[i] if i < len(reserves) else 0
+                sendable = max(0, avail - reserve)
+                to_send[i] = min(needed[i], sendable)
+                needed[i] -= to_send[i]
+            if sum(to_send) > 0:
+                preview_routes.append({
+                    "source": src_fresh["name"],
+                    "dest": dest_fresh["name"],
+                    "resources": to_send,
+                })
+    return preview_routes
+
+
+# ============================================================================
+#  MODE 6 EXECUTION: do_it_top_up
+# ============================================================================
+
+def do_it_top_up(session, destinations, dest_configs, source_city_ids,
+                 source_reserves, useFreighters, interval_hours,
+                 notif_config, log_path):
+
+    total_shipments = 0
+    first_run = True
+    next_run_time = datetime.datetime.now()
+
+    while True:
+        now = datetime.datetime.now()
+        if not first_run and now < next_run_time:
+            sleep_secs = max(0, (next_run_time - now).total_seconds())
+            time.sleep(min(sleep_secs, 60))
+            continue
+
+        if should_notify(notif_config, "start"):
+            dest_names = ", ".join(d["name"] for d in destinations)
+            sendToBot(session,
+                      f"TOP-UP CYCLE STARTING\n"
+                      f"Account: {session.username}\n"
+                      f"Destinations: {dest_names}")
+
+        cycle_sent = 0
+        consecutive_failures = 0
+
+        for dest in destinations:
+            html = session.get(city_url + str(dest["id"]))
+            dest_fresh = getCity(html)
+            targets = dest_configs[str(dest["id"])]
+
+            dest_isl_id = dest_fresh["islandId"]
+            html_isl = session.get(island_url + str(dest_isl_id))
+            dest_island = getIsland(html_isl)
+            coords = f"[{dest_island['x']}:{dest_island['y']}]"
+
+            for cid in source_city_ids:
+                needed = [0] * len(materials_names)
+                for i in range(len(materials_names)):
+                    if targets[i] is None:
+                        continue
+                    gap = targets[i] - dest_fresh["availableResources"][i]
+                    needed[i] = max(0, min(gap, dest_fresh["freeSpaceForResources"][i]))
+
+                if all(n <= 0 for n in needed):
+                    break
+
+                html = session.get(city_url + cid)
+                src_fresh = getCity(html)
+                reserves = source_reserves.get(cid, [0] * len(materials_names))
+                to_send = [0] * len(materials_names)
+                for i in range(len(materials_names)):
+                    if needed[i] <= 0:
+                        continue
+                    avail = src_fresh["availableResources"][i]
+                    reserve = reserves[i] if i < len(reserves) else 0
+                    sendable = max(0, avail - reserve)
+                    to_send[i] = min(needed[i], sendable)
+
+                if sum(to_send) > 0:
+                    route = (src_fresh, dest_fresh, dest_island["id"], *to_send)
+                    result = send_shipment(
+                        session, route, useFreighters, notif_config, log_path,
+                        "TopUp", coords
+                    )
+                    if result["success"]:
+                        total_shipments += 1
+                        cycle_sent += 1
+                        consecutive_failures = 0
+                        html = session.get(city_url + str(dest["id"]))
+                        dest_fresh = getCity(html)
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3 and should_notify(notif_config, "error"):
+                            sendToBot(session,
+                                      f"WARNING: {consecutive_failures} consecutive failures")
+
+        if should_notify(notif_config, "complete"):
+            sendToBot(session,
+                      f"TOP-UP CYCLE COMPLETE\n"
+                      f"Account: {session.username}\n"
+                      f"Shipments this cycle: {cycle_sent}\n"
+                      f"Total shipments: {total_shipments}")
+
+        next_run_time = datetime.datetime.now() + datetime.timedelta(
+            hours=interval_hours
+        )
+        dest_names = ", ".join(d["name"] for d in destinations)
+        session.setStatus(
+            f"TopUp: {dest_names} | "
+            f"Sent: {total_shipments} | "
+            f"Next: {getDateTime(next_run_time.timestamp())}"
+        )
+        first_run = False
+        sleep_secs = max(0, (next_run_time - datetime.datetime.now()).total_seconds())
         time.sleep(sleep_secs)
