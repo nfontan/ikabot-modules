@@ -730,22 +730,21 @@ def find_all_buildings(session, cities_ids, cities, building_type):
 
 def fetch_building_data(session, building_info, is_units=True):
     """
-    Fetch detailed recruitment data from a barracks or shipyard
-    
-    The unit data is in updateTemplateData -> js_barracksSlider{N} -> slider -> control_data
-    which contains a JSON string with unit_type_id, costs (citizens, wood, sulfur, etc.), 
-    and completiontime (build time in seconds)
+    Fetch detailed recruitment data from a barracks or shipyard.
+    This version is designed to be universal, parsing the server's JSON control data
+    directly to avoid language or building-specific HTML tag issues.
     """
     city_id = building_info['city_id']
     position = building_info['building_position']
     view_name = 'barracks' if is_units else 'shipyard'
     
+    # Requesting the building view via AJAX to get recruitment sliders and costs
     params = f"view={view_name}&cityId={city_id}&position={position}&backgroundView=city&currentCityId={city_id}&ajax=1"
     
     try:
         response = session.post(params)
         response_data = json.loads(response)
-    except:
+    except Exception:
         return None
     
     result = {
@@ -760,70 +759,58 @@ def fetch_building_data(session, building_info, is_units=True):
     }
     
     template_data = None
-    
     for item in response_data:
         if not isinstance(item, list) or len(item) < 2:
             continue
         
+        # Extract security actionRequest code
         if item[0] == "updateGlobalData" and isinstance(item[1], dict):
             if "actionRequest" in item[1]:
                 result['action_code'] = item[1]["actionRequest"]
         
+        # Identify the block containing unit/ship data
         elif item[0] == "updateTemplateData" and isinstance(item[1], dict):
             template_data = item[1]
     
     if not template_data:
         return None
-    
-    # Extract unit data from slider control_data
-    # Pattern: js_barracksSlider{N} or js_shipyardSlider{N}
-    slider_prefix = f"js_{view_name}Slider"
-    
+
+    # Iterate through all template keys to find sliders (e.g., js_barracksSlider or js_shipyardSlider)
+    # Your server uses 'js_barracksSlider' prefix even for ships in shipyards
     for key, value in template_data.items():
-        if not key.startswith(slider_prefix):
-            continue
-        
-        if not isinstance(value, dict):
-            continue
-        
-        slider_info = value.get('slider', {})
-        if not isinstance(slider_info, dict):
-            continue
-        
-        control_data_str = slider_info.get('control_data', '')
-        if not control_data_str:
-            continue
-        
-        try:
-            control_data = json.loads(control_data_str)
+        if 'Slider' in key and isinstance(value, dict):
+            slider_info = value.get('slider', {})
+            control_data_str = slider_info.get('control_data', '')
             
-            unit_type_id = control_data.get('unit_type_id')
-            if not unit_type_id:
+            if not control_data_str:
                 continue
             
-            costs = control_data.get('costs', {})
-            
-            unit_data = {
-                'name': control_data.get('local_name', ''),
-                'identifier': control_data.get('identifier', ''),
-                'citizens': costs.get('citizens', 0),
-                'wood': costs.get('wood', 0),
-                'wine': costs.get('wine', 0),
-                'marble': costs.get('marble', 0),
-                'crystal': costs.get('crystal', 0),
-                'sulfur': costs.get('sulfur', 0),
-                'upkeep': costs.get('upkeep', 0),
-                'time_seconds': costs.get('completiontime', 0),
-                'max_buildable': slider_info.get('max_value', 0),
-            }
-            
-            result['unit_data'][unit_type_id] = unit_data
-            
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
+            try:
+                # Parse the inner JSON string containing costs and identifiers
+                control_data = json.loads(control_data_str)
+                unit_type_id = control_data.get('unit_type_id')
+                if not unit_type_id:
+                    continue
+                
+                costs = control_data.get('costs', {})
+                
+                # 'glass' is often used instead of 'crystal' in ship data blocks
+                crystal_val = costs.get('glass', costs.get('crystal', 0))
+                
+                result['unit_data'][unit_type_id] = {
+                    'name': control_data.get('local_name', ''),
+                    'citizens': costs.get('citizens', 0),
+                    'wood': costs.get('wood', 0),
+                    'wine': costs.get('wine', 0),
+                    'marble': costs.get('marble', 0),
+                    'crystal': crystal_val,
+                    'sulfur': costs.get('sulfur', 0),
+                    'time_seconds': costs.get('completiontime', 0)
+                }
+            except Exception:
+                continue
     
-    # Check if busy - look for training queue in the HTML or check js_noUnitsSelected
-    # For simplicity, check if there's a queue via the building info
+    # Check building status from the initial city scan data
     result['is_busy'] = building_info.get('is_busy', False)
     
     return result
@@ -1036,10 +1023,12 @@ def check_resources(session, distribution, cities):
         if len(available_res) < 5:
             available_res = available_res + [0] * (5 - len(available_res))
         
-        citizens_match = re.search(r'id="js_GlobalMenu_citizens">([0-9,]+)', html)
+        citizens_match = re.search(r'id="js_GlobalMenu_citizens">([^<]+)', html)
         available_citizens = 0
         if citizens_match:
-            available_citizens = int(citizens_match.group(1).replace(',', ''))
+            # remove \u00a0 (spaces on Ikariam), normal spaces and ./,
+            raw_val = citizens_match.group(1).replace('\u00a0', '').replace(' ', '')
+            available_citizens = int(re.sub(r'[^0-9]', '', raw_val))
         
         result['available'][city_id] = {
             'resources': {
@@ -1116,8 +1105,13 @@ def display_distribution_plan(distribution, recruitment_order):
 # =============================================================================
 
 def execute_recruitment(session, distribution, is_units=True):
-    """Execute recruitment orders for all buildings"""
+    """
+    Execute recruitment orders for all buildings.
+    Uses 'BuildShips' for shipyards and 'BuildUnits' for barracks as required by the server.
+    """
     success = True
+    # The server requires different action names based on the building type
+    action_name = 'BuildUnits' if is_units else 'BuildShips'
     view_name = 'barracks' if is_units else 'shipyard'
     
     for building in distribution:
@@ -1128,6 +1122,7 @@ def execute_recruitment(session, distribution, is_units=True):
         position = building['building_position']
         action_code = building.get('action_code')
         
+        # If action_code is missing, fetch it from the building's view
         if not action_code:
             params = f"view={view_name}&cityId={city_id}&position={position}&backgroundView=city&currentCityId={city_id}&ajax=1"
             try:
@@ -1138,36 +1133,35 @@ def execute_recruitment(session, distribution, is_units=True):
                         if "actionRequest" in item[1]:
                             action_code = item[1]["actionRequest"]
                             break
-            except:
+            except Exception:
                 pass
         
         if not action_code:
-            print(f"  {building['city_name']}: Failed to get action code")
+            print(f"  {building['city_name']}: Failed to get actionRequest code")
             success = False
             continue
         
-        # Build recruitment POST data
-        # The form submits with action=BuildUnits and unit quantities as name="{unit_id}" value="{qty}"
+        # Build recruitment POST data based on HAR logs
         recruit_params = {
-            'action': 'BuildUnits',
+            'action': action_name,
             'actionRequest': action_code,
             'cityId': city_id,
             'position': position,
         }
         
-        # Add each unit's quantity
+        # Add each unit/ship ID and quantity as parameters
         for unit_idx, qty in building['assignments'].items():
-            recruit_params[str(unit_idx)] = qty
+            recruit_params[str(unit_idx)] = str(qty)
         
         try:
-            response = session.post(params=recruit_params)
+            # Send the recruitment order to the server
+            session.post(params=recruit_params)
             
-            # Count total units for this building
             total_units = sum(building['assignments'].values())
-            print(f"  {building['city_name']}: Recruited {total_units} units")
+            print(f"  {building['city_name']}: Recruited {total_units} {'units' if is_units else 'ships'}")
             
         except Exception as e:
-            print(f"  {building['city_name']}: Failed - {e}")
+            print(f"  {building['city_name']}: Failed to place order - {e}")
             success = False
     
     return success
@@ -1218,10 +1212,12 @@ def execute_recruitment_loop(session, distribution, recruitment_order, cities, i
                 if len(available_res) < 5:
                     available_res = available_res + [0] * (5 - len(available_res))
                 
-                citizens_match = re.search(r'id="js_GlobalMenu_citizens">([0-9,]+)', html)
+                citizens_match = re.search(r'id="js_GlobalMenu_citizens">([^<]+)', html)
                 available_citizens = 0
                 if citizens_match:
-                    available_citizens = int(citizens_match.group(1).replace(',', ''))
+                    # remove \u00a0 (spaces on Ikariam), normal spaces and ./,
+                    raw_val = citizens_match.group(1).replace('\u00a0', '').replace(' ', '')
+                    available_citizens = int(re.sub(r'[^0-9]', '', raw_val))
                 
                 city_resources[city_id] = {
                     'citizens': available_citizens,
@@ -1426,6 +1422,3 @@ def execute_recruitment_loop(session, distribution, recruitment_order, cities, i
         
         # Short wait before next cycle
         wait(60)
-
-
-
